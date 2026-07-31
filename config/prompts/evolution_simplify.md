@@ -11,7 +11,7 @@ Original hypothesis:
 </HYPOTHESIS_TEXT_END id="{{ hypothesis_id }}">
 
 Review of the original:
-{{ review | default('(no review available)') }}
+{{ review | default('(no review available)', true) }}
 
 Instructions:
 1. Identify which elements of the hypothesis are load-bearing vs. ornamental. Strip the latter.

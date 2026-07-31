@@ -14,7 +14,10 @@ Provided reviews for meta-analysis:
 {{ reviews }}
 
 Recent tournament debate rationales (for context on what wins and loses):
-{{ debate_rationales | default('(none yet)') }}
+{{ debate_rationales | default('(none yet)', true) }}
+
+Sources the reviewers actually consulted (every URL appeared in a real search or fetch result). Cite only from this list; never invent a URL:
+{{ sources | default('(no literature sources were recorded)', true) }}
 
 Instructions:
 - Generate a structured meta-analysis report of the provided reviews.

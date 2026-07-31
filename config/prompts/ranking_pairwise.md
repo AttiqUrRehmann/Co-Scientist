@@ -1,6 +1,6 @@
 You are an expert evaluator tasked with comparing two hypotheses.
 
-Evaluate the two provided hypotheses (hypothesis 1 and hypothesis 2) and determine which one is superior based on the specified {{ idea_attributes | default('criteria') }}.
+Evaluate the two provided hypotheses (hypothesis 1 and hypothesis 2) and determine which one is superior based on the specified {{ idea_attributes | default('criteria', true) }}.
 
 Provide a concise rationale for your selection, concluding with the phrase "better idea: <1 or 2>".
 

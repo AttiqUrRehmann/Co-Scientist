@@ -11,7 +11,7 @@ Hypothesis A:
 </HYPOTHESIS_TEXT_END id="{{ hypothesis_a_id }}">
 
 Review of Hypothesis A:
-{{ review_a | default('(no review available)') }}
+{{ review_a | default('(no review available)', true) }}
 
 Hypothesis B:
 <HYPOTHESIS_TEXT id="{{ hypothesis_b_id }}">
@@ -19,7 +19,7 @@ Hypothesis B:
 </HYPOTHESIS_TEXT_END id="{{ hypothesis_b_id }}">
 
 Review of Hypothesis B:
-{{ review_b | default('(no review available)') }}
+{{ review_b | default('(no review available)', true) }}
 
 Instructions:
 1. Identify the strongest mechanism in A and the strongest in B.
