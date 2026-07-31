@@ -16,7 +16,11 @@ Concretely:
 Provider-specific features:
 - cache_control: honored only on Anthropic. Stripped before sending elsewhere.
 - thinking / extended reasoning: Anthropic for Claude opus; on OpenAI we
-  translate to `reasoning_effort` for o-series models, else drop.
+  translate to `reasoning_effort` for o-series models. The named Gemini
+  provider accepts optional semantic levels under `[llm.gemini]`.
+- provider-owned tool-call fields: retained as opaque metadata by the
+  OpenAI-compatible adapter; only provider-documented request fields are
+  replayed (currently Gemini's thought-signature envelope).
 - batch API: Anthropic only; the BatchPool still talks to Anthropic directly.
 
 Users select a provider in `[llm] provider = "..."` and per-agent models in
@@ -154,6 +158,7 @@ def get_provider(
         return OpenAIClient(
             cfg, db=db, budget=budget, retry_policy=retry_policy,
             compat_mode=(name == "openai_compatible"),
+            provider_name=name,
         )
 
     # Named OpenAI-compat preset (openrouter, gemini, groq, together, ...).
@@ -171,6 +176,7 @@ def get_provider(
             cfg,
             db=db, budget=budget, retry_policy=retry_policy,
             compat_mode=True,
+            provider_name=name,
             preset_base_url=preset["base_url"],   # type: ignore[arg-type]
             preset_api_key_env=preset["api_key_env"],  # type: ignore[arg-type]
             default_headers=default_headers,

@@ -16,15 +16,18 @@ import pytest
 from co_scientist.config import Config
 from co_scientist.llm.anthropic_client import AgentCallSpec, CachedBlock, CallContext
 from co_scientist.llm.openai_client import (
+    _TOOL_CALL_REPLAY_FIELDS_BY_PROVIDER,
     OpenAIClient,
     _adapt_response,
     _budget_to_effort,
     _build_openai_request,
     _is_reasoning_model,
+    _provider_fields_from_tool_call,
     _translate_anthropic_message,
 )
 from co_scientist.llm.provider import KNOWN_PROVIDERS, get_provider
 from co_scientist.llm.routing import ModelRoute
+from co_scientist.llm.tool_loop import _content_to_dicts
 
 
 def _route(model: str = "gpt-5", thinking: int = 0) -> ModelRoute:
@@ -306,6 +309,88 @@ def test_translate_assistant_tool_use_to_openai_tool_calls() -> None:
     assert tc["id"] == "call_1"
 
 
+def test_translate_does_not_replay_provider_fields_by_default() -> None:
+    msg = {
+        "role": "assistant",
+        "content": [{
+            "type": "tool_use",
+            "id": "call_1",
+            "name": "search",
+            "input": {"q": "abc"},
+            "provider_fields": {
+                "extra_content": {"google": {"thought_signature": "sig"}},
+                "index": 0,
+                "response_only": True,
+            },
+        }],
+    }
+
+    tool_call = _translate_anthropic_message(msg)[0]["tool_calls"][0]
+
+    assert set(tool_call) == {"id", "type", "function"}
+
+
+def test_translate_replays_only_explicitly_allowed_provider_fields() -> None:
+    extra_content = {"google": {"thought_signature": "sig"}}
+    msg = {
+        "role": "assistant",
+        "content": [{
+            "type": "tool_use",
+            "id": "call_1",
+            "name": "search",
+            "input": {"q": "abc"},
+            "provider_fields": {
+                "extra_content": extra_content,
+                "index": 0,
+                "response_only": True,
+                "id": "spoofed-id",
+                "type": "spoofed-type",
+                "function": {"name": "spoofed-function"},
+            },
+        }],
+    }
+
+    tool_call = _translate_anthropic_message(
+        msg,
+        tool_call_replay_fields=frozenset({"extra_content"}),
+    )[0]["tool_calls"][0]
+
+    assert tool_call["extra_content"] == extra_content
+    assert "index" not in tool_call
+    assert "response_only" not in tool_call
+    assert tool_call["id"] == "call_1"
+    assert tool_call["type"] == "function"
+    assert tool_call["function"]["name"] == "search"
+
+
+@pytest.mark.parametrize("extra_content", [None, {}, [], "not-an-envelope"])
+def test_translate_drops_malformed_extra_content(extra_content) -> None:
+    msg = {
+        "role": "assistant",
+        "content": [{
+            "type": "tool_use",
+            "id": "call_1",
+            "name": "search",
+            "input": {},
+            "provider_fields": {"extra_content": extra_content},
+        }],
+    }
+
+    tool_call = _translate_anthropic_message(
+        msg,
+        tool_call_replay_fields=frozenset({"extra_content"}),
+    )[0]["tool_calls"][0]
+
+    assert "extra_content" not in tool_call
+
+
+def test_only_named_gemini_providers_enable_tool_call_metadata_replay() -> None:
+    assert {
+        "gemini": frozenset({"extra_content"}),
+        "google": frozenset({"extra_content"}),
+    } == _TOOL_CALL_REPLAY_FIELDS_BY_PROVIDER
+
+
 def test_translate_user_tool_result_to_openai_tool_message() -> None:
     msg = {
         "role": "user",
@@ -356,11 +441,13 @@ def _fake_openai_response(*, text: str = "", tool_calls: list[dict] | None = Non
     """Build a SimpleNamespace that quacks like an openai ChatCompletion."""
     tcs = []
     for tc in (tool_calls or []):
-        tcs.append(SimpleNamespace(
+        tool_call_fields = dict(
             id=tc["id"],
             type="function",
             function=SimpleNamespace(name=tc["name"], arguments=tc["arguments"]),
-        ))
+        )
+        tool_call_fields.update(tc.get("provider_fields", {}))
+        tcs.append(SimpleNamespace(**tool_call_fields))
     msg = SimpleNamespace(content=text or None, tool_calls=tcs or None)
     choice = SimpleNamespace(message=msg, finish_reason=finish)
     usage = SimpleNamespace(prompt_tokens=in_tok, completion_tokens=out_tok)
@@ -389,6 +476,95 @@ def test_adapt_response_tool_call() -> None:
     assert tu.name == "search"
     assert tu.input == {"q": "foo"}
     assert tu.id == "call_42"
+
+
+def test_adapt_response_retains_noncanonical_tool_call_fields() -> None:
+    extra_content = {"google": {"thought_signature": "sig"}}
+    raw = _fake_openai_response(
+        tool_calls=[{
+            "id": "call_42",
+            "name": "search",
+            "arguments": '{"q": "foo"}',
+            "provider_fields": {
+                "extra_content": extra_content,
+                "index": 0,
+                "response_only": True,
+            },
+        }],
+        finish="tool_calls",
+    )
+
+    tool_use = _adapt_response(raw, "gemini-3.5-flash").content[0]
+
+    assert tool_use.provider_fields == {
+        "extra_content": extra_content,
+        "index": 0,
+        "response_only": True,
+    }
+
+
+def test_provider_field_capture_merges_pydantic_model_extra() -> None:
+    class ToolCall:
+        def __init__(self) -> None:
+            self.model_extra = {
+                "extra_content": {"google": {"thought_signature": "sig"}},
+                "index": 0,
+            }
+
+        def model_dump(self):
+            return {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "search", "arguments": "{}"},
+            }
+
+    tool_call = ToolCall()
+    assert _provider_fields_from_tool_call(tool_call) == tool_call.model_extra
+
+
+def test_tool_call_metadata_policy_applies_across_the_continuation_pipeline() -> None:
+    extra_content = {"google": {"thought_signature": "opaque-signature"}}
+    raw = _fake_openai_response(
+        tool_calls=[{
+            "id": "call_42",
+            "name": "search",
+            "arguments": '{"q": "foo"}',
+            "provider_fields": {
+                "extra_content": extra_content,
+                "index": 0,
+            },
+        }],
+        finish="tool_calls",
+    )
+    assistant_blocks = _content_to_dicts(
+        _adapt_response(raw, "gemini-3.5-flash").content
+    )
+    spec = AgentCallSpec(
+        route=_route(model="gemini-3.5-flash"),
+        user_blocks=[CachedBlock("Search for foo.")],
+        extra_messages=[
+            {"role": "assistant", "content": assistant_blocks},
+            {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call_42",
+                    "content": "result",
+                }],
+            },
+        ],
+    )
+
+    strict_tool_call = _build_openai_request(spec)["messages"][1]["tool_calls"][0]
+    gemini_tool_call = _build_openai_request(
+        spec,
+        tool_call_replay_fields=_TOOL_CALL_REPLAY_FIELDS_BY_PROVIDER["gemini"],
+    )["messages"][1]["tool_calls"][0]
+
+    assert "extra_content" not in strict_tool_call
+    assert "index" not in strict_tool_call
+    assert gemini_tool_call["extra_content"] == extra_content
+    assert "index" not in gemini_tool_call
 
 
 def test_adapt_response_handles_malformed_tool_args() -> None:

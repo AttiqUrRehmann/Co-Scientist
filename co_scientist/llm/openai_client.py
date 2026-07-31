@@ -15,6 +15,11 @@ Caveats (intentional gaps vs. AnthropicClient):
 - cache_control breakpoints are stripped — only Anthropic supports them.
 - Thinking budgets are translated to `reasoning_effort` when the model name
   starts with "o" (o1/o3/o4 family); else dropped.
+- Gemini thinking levels can be configured explicitly; otherwise the model's
+  provider default is used.
+- Provider-owned tool-call fields are retained as opaque response metadata.
+  Outbound replay is provider-aware; Gemini's documented `extra_content`
+  thought-signature envelope is replayed, while other extensions are not.
 - The Anthropic Batch API has no OpenAI analogue here; BatchPool still
   routes through Anthropic.
 - `tool_result.is_error` is encoded into the tool message content; OpenAI
@@ -49,6 +54,17 @@ from .budgets import TokenBudget
 from .retry import RetryPolicy, with_retry
 from .routing import estimate_cost_usd
 
+_CANONICAL_TOOL_CALL_FIELDS = frozenset({"id", "type", "function"})
+_NO_TOOL_CALL_REPLAY_FIELDS: frozenset[str] = frozenset()
+
+# Response schemas are often broader than request schemas. Keep provider
+# metadata losslessly in normalized history, but only replay fields documented
+# as valid request input for the configured endpoint.
+_TOOL_CALL_REPLAY_FIELDS_BY_PROVIDER: dict[str, frozenset[str]] = {
+    "gemini": frozenset({"extra_content"}),
+    "google": frozenset({"extra_content"}),
+}
+
 # --------------------------------------------------------------------------- #
 # Adapter types that quack like anthropic.types.Message / content blocks
 
@@ -61,6 +77,10 @@ class _Block:
     id: str = ""
     name: str = ""
     input: dict[str, Any] = field(default_factory=dict)
+    # Opaque fields returned alongside an OpenAI-compatible tool call. They
+    # survive normalization unchanged, but the request adapter decides which
+    # fields are safe to replay for its configured provider.
+    provider_fields: dict[str, Any] = field(default_factory=dict)
     signature: str = ""
     data: str = ""
     thinking: str = ""
@@ -116,6 +136,7 @@ class OpenAIClient:
         budget: TokenBudget,
         retry_policy: RetryPolicy | None = None,
         compat_mode: bool = False,
+        provider_name: str | None = None,
         preset_base_url: str | None = None,
         preset_api_key_env: str | None = None,
         default_headers: dict[str, str] | None = None,
@@ -148,6 +169,9 @@ class OpenAIClient:
             cap_ms=cfg.retry.cap_ms,
         )
         self._compat_mode = compat_mode or preset_base_url is not None
+        self._provider_name = provider_name or (
+            "openai_compatible" if self._compat_mode else "openai"
+        )
 
         # API key resolution precedence:
         #   1. explicit OPENAI_API_KEY (cfg.secrets or env)
@@ -194,7 +218,18 @@ class OpenAIClient:
         *,
         est_input_tokens: int | None = None,
     ) -> AnthropicResponse:
-        request = _build_openai_request(spec)
+        is_gemini = self._provider_name in ("gemini", "google")
+        reasoning_effort = (
+            _gemini_reasoning_effort(self._cfg, spec) if is_gemini else None
+        )
+        request = _build_openai_request(
+            spec,
+            reasoning_effort=reasoning_effort,
+            translate_thinking_tokens=not is_gemini,
+            tool_call_replay_fields=_TOOL_CALL_REPLAY_FIELDS_BY_PROVIDER.get(
+                self._provider_name, _NO_TOOL_CALL_REPLAY_FIELDS
+            ),
+        )
 
         # Estimate + admit (same accounting as AnthropicClient).
         est_in = est_input_tokens or _rough_token_count(spec)
@@ -243,7 +278,7 @@ class OpenAIClient:
 
         trn_id = transcript_id()
         artifact = {
-            "provider": "openai_compatible" if self._compat_mode else "openai",
+            "provider": self._provider_name,
             "request": _redact(request),
             "response": message.model_dump(),
             "started_at": started.isoformat(),
@@ -287,7 +322,13 @@ class OpenAIClient:
 # --------------------------------------------------------------------------- #
 # Request translation: AgentCallSpec → OpenAI Chat Completions
 
-def _build_openai_request(spec: AgentCallSpec) -> dict[str, Any]:
+def _build_openai_request(
+    spec: AgentCallSpec,
+    *,
+    reasoning_effort: str | None = None,
+    translate_thinking_tokens: bool = True,
+    tool_call_replay_fields: frozenset[str] = _NO_TOOL_CALL_REPLAY_FIELDS,
+) -> dict[str, Any]:
     """Translate normalized spec to OpenAI's chat.completions request."""
     messages: list[dict[str, Any]] = []
 
@@ -304,7 +345,12 @@ def _build_openai_request(spec: AgentCallSpec) -> dict[str, Any]:
 
     # extra_messages comes from the tool loop in Anthropic shape; translate.
     for m in spec.extra_messages:
-        messages.extend(_translate_anthropic_message(m))
+        messages.extend(
+            _translate_anthropic_message(
+                m,
+                tool_call_replay_fields=tool_call_replay_fields,
+            )
+        )
 
     request: dict[str, Any] = {
         "model": spec.route.model,
@@ -346,15 +392,25 @@ def _build_openai_request(spec: AgentCallSpec) -> dict[str, Any]:
         elif kind == "none":
             request["tool_choice"] = "none"
 
-    # Extended-reasoning translation. The o-series models accept
-    # `reasoning_effort` ∈ {minimal, low, medium, high}; map from token budget.
-    if spec.route.thinking_tokens > 0 and _is_reasoning_model(spec.route.model):
+    # An explicit provider semantic level wins. Otherwise, reasoning-capable
+    # OpenAI models receive a level translated from the legacy token budget.
+    if reasoning_effort is not None:
+        request["reasoning_effort"] = reasoning_effort
+    elif (
+        translate_thinking_tokens
+        and spec.route.thinking_tokens > 0
+        and _is_reasoning_model(spec.route.model)
+    ):
         request["reasoning_effort"] = _budget_to_effort(spec.route.thinking_tokens)
 
     return request
 
 
-def _translate_anthropic_message(m: dict[str, Any]) -> list[dict[str, Any]]:
+def _translate_anthropic_message(
+    m: dict[str, Any],
+    *,
+    tool_call_replay_fields: frozenset[str] = _NO_TOOL_CALL_REPLAY_FIELDS,
+) -> list[dict[str, Any]]:
     """Translate one Anthropic-shaped message dict to OpenAI message(s).
 
     Anthropic assistant messages can contain mixed content blocks (text,
@@ -382,7 +438,19 @@ def _translate_anthropic_message(m: dict[str, Any]) -> list[dict[str, Any]]:
             elif btype == "tool_use":
                 args = block.get("input", {})
                 args_str = json.dumps(args, default=str, ensure_ascii=False)
-                tool_calls.append({
+                provider_fields = block.get("provider_fields", {})
+                tool_call: dict[str, Any] = {}
+                if isinstance(provider_fields, dict):
+                    # A response may contain output-only extensions that a
+                    # strict endpoint rejects on input. Replay only fields
+                    # explicitly allowed for this configured provider.
+                    tool_call.update(
+                        _provider_fields_for_replay(
+                            provider_fields,
+                            allowed_fields=tool_call_replay_fields,
+                        )
+                    )
+                tool_call.update({
                     "id": block.get("id") or f"call_{uuid.uuid4().hex[:12]}",
                     "type": "function",
                     "function": {
@@ -390,6 +458,7 @@ def _translate_anthropic_message(m: dict[str, Any]) -> list[dict[str, Any]]:
                         "arguments": args_str,
                     },
                 })
+                tool_calls.append(tool_call)
         msg: dict[str, Any] = {"role": "assistant"}
         if text_parts:
             msg["content"] = "\n".join(text_parts)
@@ -448,7 +517,6 @@ _STOP_REASON_MAP = {
     "content_filter": "refusal",
 }
 
-
 def _adapt_response(raw: Any, model: str) -> _Message:
     choice = raw.choices[0] if raw.choices else None
     finish = (getattr(choice, "finish_reason", None) or "stop") if choice else "stop"
@@ -476,6 +544,7 @@ def _adapt_response(raw: Any, model: str) -> _Message:
                 id=getattr(tc, "id", "") or f"call_{uuid.uuid4().hex[:12]}",
                 name=name,
                 input=args_obj,
+                provider_fields=_provider_fields_from_tool_call(tc),
             ))
 
     usage_obj = getattr(raw, "usage", None)
@@ -501,6 +570,68 @@ def _adapt_response(raw: Any, model: str) -> _Message:
 
 # --------------------------------------------------------------------------- #
 # Heuristics
+
+def _provider_fields_for_replay(
+    provider_fields: dict[str, Any],
+    *,
+    allowed_fields: frozenset[str],
+) -> dict[str, Any]:
+    """Filter opaque response metadata down to valid request extensions."""
+    replayable: dict[str, Any] = {}
+    for key in allowed_fields:
+        if key in _CANONICAL_TOOL_CALL_FIELDS or key not in provider_fields:
+            continue
+        value = provider_fields[key]
+        # Google's documented extra_content envelope is a non-empty object.
+        # Do not replay malformed response metadata into a strict endpoint.
+        if key == "extra_content" and (not isinstance(value, dict) or not value):
+            continue
+        replayable[key] = value
+    return replayable
+
+
+def _provider_fields_from_tool_call(tool_call: Any) -> dict[str, Any]:
+    """Retain nonstandard response fields without interpreting them.
+
+    Prefer the SDK's serialized form, then merge Pydantic extras explicitly
+    because SDK versions differ in how unknown fields are exposed. Retention
+    does not imply replay: request translation applies a provider allowlist.
+    """
+    dumped: dict[str, Any] = {}
+    model_dump = getattr(tool_call, "model_dump", None)
+    if callable(model_dump):
+        candidate = model_dump()
+        if isinstance(candidate, dict):
+            dumped.update(candidate)
+    elif isinstance(tool_call, dict):
+        dumped.update(tool_call)
+    else:
+        raw_fields = getattr(tool_call, "__dict__", None)
+        if isinstance(raw_fields, dict):
+            dumped.update(raw_fields)
+
+    model_extra = getattr(tool_call, "model_extra", None)
+    if isinstance(model_extra, dict):
+        dumped.update(model_extra)
+
+    return {
+        key: value
+        for key, value in dumped.items()
+        if key not in _CANONICAL_TOOL_CALL_FIELDS
+    }
+
+
+def _gemini_reasoning_effort(cfg: Config, spec: AgentCallSpec) -> str | None:
+    """Resolve optional Gemini thinking level for one routed agent call."""
+    gemini_cfg = cfg.llm.gemini
+    route_key = (
+        f"{spec.route.agent}.{spec.route.mode}"
+        if spec.route.mode
+        else spec.route.agent
+    )
+    level = gemini_cfg.thinking_by_mode.get(route_key, gemini_cfg.thinking_level)
+    return None if level == "default" else level
+
 
 def _is_reasoning_model(model: str) -> bool:
     m = model.lower()
