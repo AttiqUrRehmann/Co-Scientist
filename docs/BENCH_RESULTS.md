@@ -2,6 +2,21 @@
 
 Pilot results from every cross-model bench run on this codebase. See [`../README.md`](../README.md) for what the bench is and how to run it.
 
+> **Archived: these runs predate the move to subscription CLIs.**
+> Every bench below was produced when agents called metered LLM APIs directly
+> (Anthropic / OpenAI / OpenRouter). That architecture is gone — agents now run
+> through `claude -p` or `codex exec`, and the presets that referenced
+> third-party API models (`paper`, `paper-aml*`, `frontier-aml-vs-raw`) no
+> longer exist.
+>
+> These numbers are kept because the goals, gold sets, and produced hypotheses
+> remain informative. They are **not reproducible with the current code**, and
+> new runs are not directly comparable: the prompts and gold sets are
+> unchanged, but the tool loop now belongs to the CLI rather than to this
+> repo, and the `$` column measured real spend where it now measures a
+> reported equivalent cost. Current presets are `claude-aml`,
+> `claude-aml-vs-raw`, and `cross-backend-aml`.
+
 _Auto-generated from `data/co_scientist.db` by_ _`python scripts/build_bench_report.py`._ _Re-run after any new `co-scientist bench` to refresh._
 
 ## How to read this doc

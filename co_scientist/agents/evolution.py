@@ -18,10 +18,10 @@ from typing import Any, Literal
 import numpy as np
 
 from .. import ids
-from ..llm.anthropic_client import AgentCallSpec, CachedBlock, CallContext
 from ..llm.prompts import render
 from ..llm.routing import route
 from ..llm.tool_loop import ToolLoopExhausted, run_tool_loop
+from ..llm.types import AgentCallSpec, CachedBlock, CallContext
 from ..logging import get_logger
 from ..models import CitedPaper, Hypothesis, Task, TaskResult
 from ..safety.quoting import quote_hypothesis

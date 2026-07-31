@@ -19,12 +19,20 @@ def test_default_routes_use_opus_for_heavy_modes() -> None:
 
 
 def test_thinking_only_on_opus() -> None:
+    """Matched by substring so the CLI alias "opus" counts alongside
+    "claude-opus-5"."""
     cfg = Config()
     r = route(cfg, "reflection", "verification")
-    if r.model.startswith("claude-opus"):
+    if "opus" in r.model.lower():
         assert r.thinking_tokens == cfg.thinking.reflection_verification
     else:
         assert r.thinking_tokens == 0
+
+
+def test_thinking_is_zero_for_non_opus_routes() -> None:
+    cfg = Config()
+    assert "opus" not in cfg.models.ranking_pairwise.lower()
+    assert route(cfg, "ranking", "pairwise").thinking_tokens == 0
 
 
 def test_degrade_walks_chain_once() -> None:
@@ -91,12 +99,16 @@ def test_unknown_mini_model_uses_mini_tier_pricing() -> None:
 def test_unknown_opus_class_model_uses_opus_pricing() -> None:
     """Family hints map upward as well: an unknown opus-named model should
     NOT silently price as a sonnet (and risk underbudgeting)."""
-    cost = estimate_cost_usd(
+    opus = estimate_cost_usd(
         model="anthropic/claude-99-opus-experimental",
         input_tokens=1_000_000, output_tokens=1_000_000,
     )
-    # opus tier: 15 + 75 = $90/M+M
-    assert cost > 50.0
+    sonnet = estimate_cost_usd(
+        model="claude-sonnet-5", input_tokens=1_000_000, output_tokens=1_000_000,
+    )
+    # opus tier: 5 + 25 = $30/M+M, versus sonnet's 3 + 15 = $18/M+M.
+    assert opus == 30.0
+    assert opus > sonnet
 
 
 def test_known_model_takes_precedence_over_family_hint() -> None:

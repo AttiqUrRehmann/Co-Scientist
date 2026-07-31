@@ -39,28 +39,30 @@ def _make_hyp(hid: str, text: str = "h") -> Hypothesis:
 # ----------------------------- presets ----------------------------- #
 
 
-def test_paper_preset_has_documented_candidates() -> None:
-    p = get_preset("paper")
-    labels = [c.label for c in p.candidates]
-    # The 3 paper baselines + the user-added Haiku.
-    assert labels == [
-        "gemini-2-flash-thinking",
-        "gemini-2-pro",
-        "openai-o1",
-        "claude-haiku-4.5",
-    ]
-    # Suggested judge is the user-specified gemini-3-flash-preview.
-    assert "gemini-3-flash-preview" in p.suggested_judge
-    # All routed through OpenRouter so a single API key suffices.
-    for c in p.candidates:
-        assert c.provider == "openrouter"
-    # paper preset has no default goal / gold set.
-    assert p.default_goal is None
-    assert p.goldset is None
+def test_every_preset_runs_on_a_subscription_backend() -> None:
+    """No preset may reference an API-key provider — none exist any more."""
+    for preset in PRESETS.values():
+        for c in preset.candidates:
+            assert c.provider in {"claude_cli", "codex_cli"}, (
+                f"{preset.name}/{c.label} uses retired provider {c.provider!r}"
+            )
+        backend, _, _model = preset.suggested_judge.partition(":")
+        assert backend in {"claude_cli", "codex_cli"}
+
+
+def test_claude_preset_spans_the_capability_tiers() -> None:
+    p = get_preset("claude-aml")
+    assert [c.label for c in p.candidates] == ["opus", "sonnet", "haiku"]
+    assert all(c.provider == "claude_cli" for c in p.candidates)
+
+
+def test_cross_backend_preset_pits_the_two_clis_against_each_other() -> None:
+    p = get_preset("cross-backend-aml")
+    assert {c.provider for c in p.candidates} == {"claude_cli", "codex_cli"}
 
 
 def test_paper_aml_preset_bundles_goal_and_goldset() -> None:
-    p = get_preset("paper-aml")
+    p = get_preset("claude-aml")
     assert p.default_goal is not None
     assert "AML" in p.default_goal or "acute myeloid leukemia" in p.default_goal.lower()
     # The strict methodology constraints should be in the prompt.
@@ -75,9 +77,9 @@ def test_paper_aml_preset_bundles_goal_and_goldset() -> None:
 
 
 def test_vs_raw_preset_doubles_every_candidate() -> None:
-    p = get_preset("paper-aml-vs-raw")
-    # Same 4 base candidates x 2 modes = 8 entries.
-    assert len(p.candidates) == 8
+    p = get_preset("claude-aml-vs-raw")
+    # 3 base candidates x 2 modes = 6 entries.
+    assert len(p.candidates) == 6
     modes = {c.mode for c in p.candidates}
     assert modes == {"pipeline", "direct"}
     # Labels are suffixed so the result table is unambiguous.
@@ -92,19 +94,6 @@ def test_vs_raw_preset_doubles_every_candidate() -> None:
         assert modes_for_m == {"pipeline", "direct"}
 
 
-def test_frontier_vs_raw_preset_lists_current_models() -> None:
-    p = get_preset("frontier-aml-vs-raw")
-    base_models = {c.model for c in p.candidates}
-    # We don't pin exact strings (those drift) but require that the
-    # frontier set is structurally distinct from the paper baselines.
-    paper_models = {c.model for c in get_preset("paper-aml").candidates}
-    assert base_models != paper_models
-    assert len(base_models) >= 3
-    # All routed via OpenRouter so one key works.
-    for c in p.candidates:
-        assert c.provider == "openrouter"
-
-
 def test_get_preset_raises_on_unknown_name() -> None:
     import pytest as _pytest
 
@@ -113,54 +102,46 @@ def test_get_preset_raises_on_unknown_name() -> None:
 
 
 def test_presets_dict_listed() -> None:
-    assert "paper" in PRESETS
+    assert "claude-aml" in PRESETS
 
 
 # ----------------------------- _candidate_cfg ----------------------------- #
 
 
-def test_candidate_cfg_sets_provider_and_propagates_model_to_all_roles() -> None:
+def test_candidate_cfg_sets_backend_and_propagates_model_to_all_roles() -> None:
     base = Config()
-    base.llm.provider = "anthropic"
-    cfg = _candidate_cfg(base, "openrouter", "google/gemini-3-flash-preview")
-    assert cfg.llm.provider == "openrouter"
-    assert cfg.models.generation == "google/gemini-3-flash-preview"
-    assert cfg.models.reflection == "google/gemini-3-flash-preview"
-    assert cfg.models.ranking_pairwise == "google/gemini-3-flash-preview"
+    base.llm.provider = "claude_cli"
+    cfg = _candidate_cfg(base, "codex_cli", "gpt-5.6-codex")
+    assert cfg.llm.provider == "codex_cli"
+    assert cfg.models.generation == "gpt-5.6-codex"
+    assert cfg.models.reflection == "gpt-5.6-codex"
+    assert cfg.models.ranking_pairwise == "gpt-5.6-codex"
 
 
-def test_candidate_cfg_zeros_thinking_for_non_anthropic() -> None:
-    """Thinking budgets are Anthropic-only; bench shouldn't try to use them
-    against OpenAI/Gemini and risk a wasted reservation."""
-    base = Config()
-    base.thinking.generation_literature = 8000  # non-zero
-    cfg = _candidate_cfg(base, "openrouter", "google/gemini-3-flash-preview")
-    assert cfg.thinking.generation_literature == 0
-    assert cfg.thinking.reflection_verification == 0
-
-
-def test_candidate_cfg_preserves_thinking_for_anthropic() -> None:
+def test_candidate_cfg_preserves_thinking_budgets() -> None:
+    """Both backends map thinking budgets onto an effort tier, so unlike the
+    old API path there is nothing to zero out per-vendor."""
     base = Config()
     base.thinking.generation_literature = 4000
-    cfg = _candidate_cfg(base, "anthropic", "claude-opus-4-7")
-    assert cfg.thinking.generation_literature == 4000
+    assert _candidate_cfg(base, "claude_cli", "opus").thinking.generation_literature == 4000
+    assert _candidate_cfg(base, "codex_cli", "gpt-5.6-codex").thinking.generation_literature == 4000
 
 
 def test_candidate_cfg_is_deep_copy() -> None:
     """Mutations to the per-candidate cfg must not leak back to the base."""
     base = Config()
     base.run.budget_usd = 25.0
-    cfg = _candidate_cfg(base, "openai", "gpt-5")
+    cfg = _candidate_cfg(base, "claude_cli", "sonnet")
     cfg.run.budget_usd = 999.0
     assert base.run.budget_usd == 25.0
 
 
 def test_candidate_cfg_flattens_budget_shares_onto_generation() -> None:
-    """Without this, expensive models like o1 fail admission on their very
+    """Without this, a high-reasoning candidate fails admission on its very
     first call because the per-agent generation share (~20%) + half-reserve
     isn't enough headroom for one max-output reservation."""
     base = Config()
-    cfg = _candidate_cfg(base, "openrouter", "openai/o1")
+    cfg = _candidate_cfg(base, "claude_cli", "opus")
     assert cfg.budget_shares.generation == 1.0
     assert cfg.budget_shares.ranking == 0.0
     assert cfg.budget_shares.reflection == 0.0
@@ -340,9 +321,6 @@ async def test_run_bench_writes_summary_and_status(tmp_cfg) -> None:
     async def fake_judge(judge_llm, judge_cfg, ses, a, b):
         return "a", "fake", 0.0, 5
 
-    tmp_cfg.secrets.OPENROUTER_API_KEY = "fake"
-    tmp_cfg.secrets.ANTHROPIC_API_KEY = "fake"
-
     with (
         patch("co_scientist.bench.runner.GenerationAgent.execute", new=fake_execute),
         patch("co_scientist.bench.runner._judge_match", side_effect=fake_judge),
@@ -352,13 +330,13 @@ async def test_run_bench_writes_summary_and_status(tmp_cfg) -> None:
             tmp_cfg,
             goal="test goal",
             candidates=[
-                BenchCandidate("a", "openrouter", "google/gemini-3-flash-preview"),
-                BenchCandidate("b", "openrouter", "openai/gpt-5"),
+                BenchCandidate("a", "claude_cli", "opus"),
+                BenchCandidate("b", "claude_cli", "sonnet"),
             ],
             n_hyps_per_candidate=1,
             matches_per_pair=2,
-            judge_provider="anthropic",
-            judge_model="claude-sonnet-4-6",
+            judge_provider="claude_cli",
+            judge_model="sonnet",
         )
 
     assert outcome.bench_id.startswith("bnc_")

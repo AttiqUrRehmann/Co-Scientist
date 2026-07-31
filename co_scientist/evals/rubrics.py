@@ -1,20 +1,22 @@
 """LLM-as-judge rubric scoring.
 
-The judge is a separate Anthropic call (defaults to Sonnet) that takes:
+The judge is a separate call (defaults to Sonnet) that takes:
 - a candidate artifact (hypothesis record / review record / final overview)
 - a rubric: list of criteria with name, weight, scoring guidance
 
 and returns per-criterion 1-5 scores + a total. We do NOT use the same model
 as the agent under test, to reduce echo-judge bias.
+
+Like everything else, it runs through the configured agent CLI on a
+subscription — the judge is deliberately cheap to run so evals stay routine.
 """
 
 from __future__ import annotations
 
-import json
-import os
 from dataclasses import dataclass
 from typing import Any
 
+from ..agents.schemas import RECORD_RUBRIC_SCORE_TOOL
 from ..config import Config
 
 
@@ -25,29 +27,9 @@ class RubricCriterion:
     guidance: str = ""
 
 
-JUDGE_TOOL: dict[str, Any] = {
-    "name": "record_rubric_score",
-    "description": "Record per-criterion 1-5 scores and a brief rationale.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "scores": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name":      {"type": "string"},
-                        "score":     {"type": "integer", "minimum": 1, "maximum": 5},
-                        "rationale": {"type": "string"},
-                    },
-                    "required": ["name", "score", "rationale"],
-                },
-            },
-            "overall_notes": {"type": "string"},
-        },
-        "required": ["scores"],
-    },
-}
+# Historical alias; the schema itself lives with the other record_* tools so
+# the MCP server can serve it.
+JUDGE_TOOL: dict[str, Any] = RECORD_RUBRIC_SCORE_TOOL
 
 
 def weighted_total(rubric: list[RubricCriterion], scores: list[dict[str, Any]]) -> float:
@@ -89,95 +71,56 @@ async def judge(
         f"Rubric:\n{rubric_text}"
     )
 
-    provider = (cfg.llm.provider or "anthropic").lower()
-    if provider == "anthropic":
-        return await _judge_anthropic(cfg, system=system, user=user, rubric=rubric)
-    return await _judge_openai(cfg, system=system, user=user, rubric=rubric)
+    return await _judge_via_backend(cfg, system=system, user=user, rubric=rubric)
 
 
-async def _judge_anthropic(
+async def _judge_via_backend(
     cfg: Config, *, system: str, user: str, rubric: list[RubricCriterion]
 ) -> dict[str, Any]:
-    api_key = cfg.secrets.ANTHROPIC_API_KEY or os.environ.get("ANTHROPIC_API_KEY") or ""
-    if not api_key:
-        return {"scores": [], "weighted": 0.0, "notes": "no ANTHROPIC_API_KEY"}
-    from anthropic import AsyncAnthropic
+    """Score via the configured agent CLI.
 
-    client = AsyncAnthropic(api_key=api_key)
-    resp = await client.messages.create(
-        model=cfg.models.judge,
-        system=system,
-        max_tokens=1024,
-        tools=[JUDGE_TOOL],
-        tool_choice={"type": "tool", "name": "record_rubric_score"},
-        messages=[{"role": "user", "content": user}],
+    Runs with `db=None`: a judgement is a one-off with no session to attach a
+    transcript to, and the eval runner aggregates over many fixtures anyway.
+    """
+    from ..llm.budgets import TokenBudget
+    from ..llm.provider import get_provider
+    from ..llm.routing import route
+    from ..llm.types import AgentCallSpec, CachedBlock, CallContext
+
+    budget = TokenBudget(
+        cfg=cfg, budget_tokens=cfg.run.budget_tokens, budget_usd=cfg.run.budget_usd,
     )
-    for b in resp.content:
-        if getattr(b, "type", None) == "tool_use" and getattr(b, "name", "") == "record_rubric_score":
-            inp = getattr(b, "input", None)
-            if isinstance(inp, dict):
-                scores = inp.get("scores", [])
-                return {
-                    "scores": scores,
-                    "weighted": weighted_total(rubric, scores),
-                    "notes": inp.get("overall_notes", ""),
-                }
-    return {"scores": [], "weighted": 0.0, "notes": "no tool_use in response"}
-
-
-async def _judge_openai(
-    cfg: Config, *, system: str, user: str, rubric: list[RubricCriterion]
-) -> dict[str, Any]:
-    api_key = cfg.secrets.OPENAI_API_KEY or os.environ.get("OPENAI_API_KEY") or ""
-    base_url = cfg.llm.openai.base_url or os.environ.get("OPENAI_BASE_URL")
-    if not api_key and not base_url:
-        return {"scores": [], "weighted": 0.0, "notes": "no OPENAI_API_KEY"}
-    if not api_key:
-        api_key = "compat-no-key"
     try:
-        from openai import AsyncOpenAI
-    except ImportError:
-        return {"scores": [], "weighted": 0.0, "notes": "openai SDK not installed"}
+        provider = get_provider(cfg, db=None, budget=budget)
+    except Exception as e:  # backend missing / not signed in
+        return {"scores": [], "weighted": 0.0, "notes": f"judge unavailable: {e}"}
 
-    kwargs: dict[str, Any] = {"api_key": api_key}
-    if base_url:
-        kwargs["base_url"] = base_url
-    client = AsyncOpenAI(**kwargs)
-    resp = await client.chat.completions.create(
-        model=cfg.models.judge,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        max_tokens=1024,
-        tools=[{
-            "type": "function",
-            "function": {
-                "name": JUDGE_TOOL["name"],
-                "description": JUDGE_TOOL["description"],
-                "parameters": JUDGE_TOOL["input_schema"],
-            },
-        }],
-        tool_choice={"type": "function", "function": {"name": JUDGE_TOOL["name"]}},
+    spec = AgentCallSpec(
+        route=route(cfg, "judge"),
+        system_blocks=[CachedBlock(system, cache=True)],
+        user_blocks=[CachedBlock(user)],
+        tools=[RECORD_RUBRIC_SCORE_TOOL],
+        tool_choice={"type": "tool", "name": "record_rubric_score"},
+        max_output_tokens=1024,
     )
-    if not resp.choices:
-        return {"scores": [], "weighted": 0.0, "notes": "empty response"}
-    msg = resp.choices[0].message
-    for tc in (msg.tool_calls or []):
-        fn = getattr(tc, "function", None)
-        if fn and getattr(fn, "name", "") == JUDGE_TOOL["name"]:
-            try:
-                inp = json.loads(getattr(fn, "arguments", "{}"))
-            except json.JSONDecodeError:
-                continue
-            if isinstance(inp, dict):
-                scores = inp.get("scores", [])
-                return {
-                    "scores": scores,
-                    "weighted": weighted_total(rubric, scores),
-                    "notes": inp.get("overall_notes", ""),
-                }
-    return {"scores": [], "weighted": 0.0, "notes": "no tool_call in response"}
+    ctx = CallContext(
+        session_id="eval", task_id=None, agent="judge", action="RubricScore",
+    )
+
+    try:
+        resp = await provider.call(spec, ctx)
+    except Exception as e:
+        return {"scores": [], "weighted": 0.0, "notes": f"judge call failed: {e}"}
+
+    for name, payload in (resp.capture.records if resp.capture else []):
+        if name == "record_rubric_score":
+            scores = payload.get("scores", [])
+            return {
+                "scores": scores,
+                "weighted": weighted_total(rubric, scores),
+                "notes": payload.get("overall_notes", ""),
+            }
+    return {"scores": [], "weighted": 0.0, "notes": "no rubric score recorded"}
 
 
 # Pre-built rubrics for the four agents that have measurable outputs.

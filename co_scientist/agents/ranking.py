@@ -20,9 +20,9 @@ from typing import Literal
 import numpy as np
 
 from .. import ids
-from ..llm.anthropic_client import AgentCallSpec, CachedBlock, CallContext
 from ..llm.prompts import render
 from ..llm.routing import route
+from ..llm.types import AgentCallSpec, CachedBlock, CallContext
 from ..logging import get_logger
 from ..models import Hypothesis, Task, TaskResult, TournamentMatch
 from ..orchestrator.elo import update_elo

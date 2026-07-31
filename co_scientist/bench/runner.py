@@ -18,11 +18,11 @@ from ..agents.base import AgentDeps
 from ..agents.generation import GenerationAgent
 from ..agents.ranking import _parse_better_idea
 from ..config import Config
-from ..llm.anthropic_client import AgentCallSpec, CachedBlock, CallContext
 from ..llm.budgets import TokenBudget
 from ..llm.prompts import render
 from ..llm.provider import get_provider
 from ..llm.routing import ModelRoute
+from ..llm.types import AgentCallSpec, CachedBlock, CallContext
 from ..logging import bind, get_logger
 from ..models import Hypothesis, ResearchPlan, Session, Task
 from ..orchestrator.elo import update_elo
@@ -87,8 +87,8 @@ class BenchCandidate:
     """
 
     label: str
-    provider: str          # anthropic | openai | openrouter | gemini | ...
-    model: str             # provider-specific model id
+    provider: str          # claude_cli | codex_cli
+    model: str             # backend-specific model id or CLI alias
     mode: str = "pipeline" # pipeline | direct
 
 
@@ -424,8 +424,8 @@ async def _generate_direct_for_candidate(
     """
     from ..agents.generation import _render_hypothesis_md
     from ..agents.schemas import RECORD_HYPOTHESIS_TOOL
-    from ..llm.anthropic_client import AgentCallSpec, CachedBlock, CallContext
     from ..llm.routing import ModelRoute, thinking_budget_for
+    from ..llm.types import AgentCallSpec, CachedBlock, CallContext
     from ..models import CitedPaper, Hypothesis
     from ..storage.artifacts import write_json
     from ..storage.repos import hypotheses as hyp_repo
@@ -589,19 +589,15 @@ async def _generate_direct_for_candidate(
 
 
 def _candidate_cfg(base_cfg: Config, provider: str, model: str) -> Config:
-    """Deep-copy base_cfg + apply per-candidate provider + model.
-
-    Anthropic-only knobs (thinking budgets, batch) get zeroed when the
-    candidate isn't Anthropic, so the OpenAI translator doesn't try to
-    map something that won't help.
+    """Deep-copy base_cfg + apply per-candidate backend + model.
 
     Budget shares are flattened: each candidate already has its own
     dedicated TokenBudget (per_candidate_budget_usd), so the per-agent
     split inside TokenBudget would double-count. Give 100% of the
     candidate budget to generation. The other agents don't run in the
     bench path so their shares don't matter — except that reasoning
-    models like o1 reserve large output budgets per call, and without
-    100% generation share the very first call can fail admission.
+    models reserve large output budgets per call, and without 100%
+    generation share the very first call can fail admission.
     """
     cfg = base_cfg.model_copy(deep=True)
     cfg.llm.provider = provider
@@ -612,10 +608,6 @@ def _candidate_cfg(base_cfg: Config, provider: str, model: str) -> Config:
                  "metareview_feedback", "metareview_final",
                  "parse_goal", "classifier"):
         setattr(cfg.models, attr, model)
-    if provider != "anthropic":
-        # Thinking / cache features only work on Anthropic.
-        for attr in cfg.thinking.__class__.model_fields:
-            setattr(cfg.thinking, attr, 0)
     # Flatten budget shares onto generation.
     cfg.budget_shares.generation = 1.0
     cfg.budget_shares.reflection = 0.0

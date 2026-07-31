@@ -5,17 +5,15 @@ A small Haiku-backed classifier with a structured-output tool. Placement:
 - hypothesis-save time (mandatory): ok / quarantine / block
 - final-report time (optional): ok / redact_quarantined / block_publish
 
-Defensive use only. When the API key is missing, we return `ok` and log a
+Defensive use only. When the backend is unavailable we return `ok` and log a
 warning rather than crashing the session — agents stay functional in dev.
 """
 
 from __future__ import annotations
 
-import os
 from typing import Any, Literal
 
-from anthropic import AsyncAnthropic
-
+from ..agents.schemas import RECORD_SAFETY_ASSESSMENT_TOOL
 from ..config import Config
 from ..logging import get_logger
 
@@ -24,37 +22,9 @@ log = get_logger("safety.classifier")
 
 Action = Literal["allow", "warn", "block", "quarantine"]
 
-
-CLASSIFY_TOOL: dict[str, Any] = {
-    "name": "record_safety_assessment",
-    "description": "Record a structured safety assessment of input text.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "categories": {
-                "type": "array",
-                "items": {
-                    "type": "string",
-                    "enum": [
-                        "none",
-                        "dual_use_bio",
-                        "cbrn",
-                        "weapons",
-                        "illicit_synthesis",
-                        "csam",
-                    ],
-                },
-                "description": "All categories that apply. Use ['none'] if benign.",
-            },
-            "confidence": {
-                "type": "number", "minimum": 0, "maximum": 1,
-                "description": "0..1 confidence in the worst-case categorization.",
-            },
-            "rationale": {"type": "string"},
-        },
-        "required": ["categories", "confidence", "rationale"],
-    },
-}
+# The schema lives with the other record_* tools so the MCP server can serve
+# it to the CLI backends.
+CLASSIFY_TOOL: dict[str, Any] = RECORD_SAFETY_ASSESSMENT_TOOL
 
 
 _SYSTEM_PROMPT = (
@@ -102,47 +72,83 @@ class ClassifierResult:
 
 
 class SafetyClassifier:
-    """One classifier per Config; reuses the Anthropic client."""
+    """One classifier per Config; lazily builds the backend on first use.
+
+    Each classification is its own CLI call, so this runs on the cheapest
+    configured model (`[models] classifier`, default "haiku") and is kept to a
+    single turn with no research tools.
+    """
 
     def __init__(self, cfg: Config) -> None:
         self._cfg = cfg
-        self._client: AsyncAnthropic | None = None
-        api_key = cfg.secrets.ANTHROPIC_API_KEY or os.environ.get("ANTHROPIC_API_KEY") or ""
-        if api_key:
-            self._client = AsyncAnthropic(api_key=api_key)
+        self._provider: Any = None
+        self._unavailable = False
+
+    def _get_provider(self) -> Any:
+        if self._provider is None and not self._unavailable:
+            from ..llm.budgets import TokenBudget
+            from ..llm.provider import get_provider
+
+            try:
+                self._provider = get_provider(
+                    self._cfg,
+                    db=None,
+                    budget=TokenBudget(
+                        cfg=self._cfg,
+                        budget_tokens=self._cfg.run.budget_tokens,
+                        budget_usd=self._cfg.run.budget_usd,
+                    ),
+                )
+            except Exception as e:            # backend missing / not signed in
+                log.warning("classifier_backend_unavailable", err=str(e))
+                self._unavailable = True
+        return self._provider
 
     async def classify(self, text: str, *, label: str = "input") -> ClassifierResult:
         """Always returns a result; degrades to benign + warning log on failure."""
-        if not self._cfg.safety.enable_classifier or self._client is None:
+        if not self._cfg.safety.enable_classifier:
             return ClassifierResult(categories=["none"], confidence=0.0,
-                                    rationale="classifier disabled or no key")
+                                    rationale="classifier disabled")
         text = text.strip()
         if not text:
             return ClassifierResult(categories=["none"], confidence=1.0,
                                     rationale="empty input")
+
+        provider = self._get_provider()
+        if provider is None:
+            return ClassifierResult(categories=["none"], confidence=0.0,
+                                    rationale="classifier backend unavailable")
+
+        from ..llm.routing import route
+        from ..llm.types import AgentCallSpec, CachedBlock, CallContext
+
+        spec = AgentCallSpec(
+            route=route(self._cfg, "classifier"),
+            system_blocks=[CachedBlock(_SYSTEM_PROMPT, cache=True)],
+            user_blocks=[CachedBlock(
+                f'<TEXT label="{label}">\n{text[:8000]}\n</TEXT>'
+            )],
+            tools=[CLASSIFY_TOOL],
+            tool_choice={"type": "tool", "name": "record_safety_assessment"},
+            max_output_tokens=512,
+        )
+        ctx = CallContext(
+            session_id="safety", task_id=None, agent="classifier", action="Classify",
+        )
+
         try:
-            resp = await self._client.messages.create(
-                model=self._cfg.models.classifier,
-                system=_SYSTEM_PROMPT,
-                max_tokens=512,
-                tools=[CLASSIFY_TOOL],
-                tool_choice={"type": "tool", "name": "record_safety_assessment"},
-                messages=[
-                    {"role": "user", "content": f"<TEXT label=\"{label}\">\n{text[:8000]}\n</TEXT>"},
-                ],
-            )
+            resp = await provider.call(spec, ctx)
         except Exception as e:
             log.warning("classifier_call_failed", err=str(e))
             return ClassifierResult(categories=["none"], confidence=0.0,
                                     rationale=f"classifier_error: {e!s}")
-        for b in resp.content:
-            if getattr(b, "type", None) == "tool_use" and getattr(b, "name", "") == "record_safety_assessment":
-                inp = getattr(b, "input", None)
-                if isinstance(inp, dict):
-                    return ClassifierResult(
-                        categories=list(inp.get("categories", ["none"])),
-                        confidence=float(inp.get("confidence", 0.0)),
-                        rationale=str(inp.get("rationale", "")),
-                    )
+
+        for name, payload in (resp.capture.records if resp.capture else []):
+            if name == "record_safety_assessment":
+                return ClassifierResult(
+                    categories=list(payload.get("categories", ["none"])),
+                    confidence=float(payload.get("confidence", 0.0)),
+                    rationale=str(payload.get("rationale", "")),
+                )
         return ClassifierResult(categories=["none"], confidence=0.0,
-                                rationale="no tool_use block in response")
+                                rationale="no safety assessment recorded")

@@ -13,9 +13,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from .. import ids
-from ..llm.anthropic_client import AgentCallSpec, CachedBlock, CallContext
 from ..llm.prompts import render
 from ..llm.routing import route
+from ..llm.types import AgentCallSpec, CachedBlock, CallContext
 from ..logging import get_logger
 from ..models import SystemFeedback, Task, TaskResult
 from ..storage.artifacts import write_json, write_text

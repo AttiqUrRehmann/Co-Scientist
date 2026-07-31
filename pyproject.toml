@@ -10,11 +10,11 @@ readme = "README.md"
 requires-python = ">=3.11,<3.14"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Co-Scientist contributors" }]
-keywords = ["ai", "agents", "research", "anthropic", "claude"]
+keywords = ["ai", "agents", "research", "claude-code", "codex", "claude"]
 
 dependencies = [
-    # LLM clients (provider is selectable via [llm] provider = ...)
-    "anthropic>=0.40.0",
+    # No LLM SDK: reasoning runs through the Claude Code / Codex CLIs on a
+    # subscription. `openai` is here for embeddings only.
     "openai>=1.40.0",
     # Async stack
     "aiosqlite>=0.20.0",
@@ -27,9 +27,10 @@ dependencies = [
     "tomli>=2.0.1; python_version < '3.11'",
     # Templates
     "jinja2>=3.1.4",
+    # Structured-output validation at the MCP tool boundary
+    "jsonschema>=4.22.0",
     # Vectors + embeddings
     "faiss-cpu>=1.8.0",
-    "voyageai>=0.2.3",
     "numpy>=1.26.0",
     "scikit-learn>=1.5.0",
     # Web fetch + parsing
@@ -54,9 +55,8 @@ dev = [
     "ruff>=0.6.0",
     "mypy>=1.11.0",
 ]
-# `openai` extra retained for compatibility with older configs; the SDK is
-# now in the default dependency set so the OpenAI provider works out of the
-# box.
+# Retained so older `pip install co-scientist[openai]` invocations keep
+# resolving; the SDK is in the default dependency set (embeddings only).
 openai = ["openai>=1.40.0"]
 
 [project.scripts]

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -16,7 +17,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from .config import has_llm_key, load_config, provider_key_env
+from .config import load_config
 from .logging import get_logger, setup_logging
 from .storage import db as db_mod
 
@@ -51,6 +52,101 @@ def _main(
     ctx.obj = _common_setup(config_file, verbose)
 
 
+def _require_backend(cfg) -> None:
+    """Abort early if the configured agent CLI is missing or not signed in."""
+    from .llm.provider import check_backend
+
+    status = check_backend(cfg)
+    if status.ok:
+        return
+    console.print(
+        f"[red]Backend {status.backend} is not ready:[/red] {status.detail}"
+    )
+    console.print("[dim]Run `co-scientist doctor` for details.[/dim]")
+    raise typer.Exit(1)
+
+
+@app.command()
+def doctor(ctx: typer.Context) -> None:
+    """Check that the agent CLI, subscription login, and MCP server all work.
+
+    Costs nothing against your subscription: it probes versions and the MCP
+    handshake, never a model call.
+    """
+    cfg, _ = ctx.obj
+    from .config import has_embeddings_key
+    from .llm.provider import check_backend
+
+    status = check_backend(cfg)
+    tbl = Table(title="co-scientist doctor", show_header=False, box=None)
+    tbl.add_row("backend", status.backend)
+    tbl.add_row("binary", status.binary_path or f"[red]{status.binary} not found[/red]")
+    tbl.add_row("version", status.version or "[red]—[/red]")
+    tbl.add_row(
+        "subscription", "[green]signed in[/green]" if status.authenticated else "[red]no[/red]"
+    )
+    tbl.add_row("detail", status.detail)
+
+    ok_mcp, mcp_detail = _check_mcp()
+    tbl.add_row("MCP server", "[green]ok[/green]" if ok_mcp else f"[red]{mcp_detail}[/red]")
+    if ok_mcp:
+        tbl.add_row("MCP tools", mcp_detail)
+
+    tbl.add_row(
+        "embeddings",
+        cfg.embeddings.model if has_embeddings_key(cfg)
+        else "[yellow]hash fallback — set OPENAI_API_KEY for real dedup[/yellow]",
+    )
+    console.print(tbl)
+
+    if not (status.ok and ok_mcp):
+        raise typer.Exit(1)
+    console.print("[green]All checks passed.[/green]")
+
+
+def _check_mcp() -> tuple[bool, str]:
+    """Run an initialize + tools/list handshake against our own MCP server."""
+    import json
+    import subprocess
+    import sys
+    import tempfile
+
+    frames = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+         "params": {"protocolVersion": "2025-06-18", "capabilities": {}}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+    ]
+    payload = "\n".join(json.dumps(f) for f in frames) + "\n"
+    with tempfile.TemporaryDirectory(prefix="cosci-doctor-") as tmp:
+        env = dict(os.environ)
+        env.update({
+            "COSCI_CAPTURE_DIR": tmp,
+            "COSCI_RECORD_TOOLS": "record_hypothesis",
+            "COSCI_AGENT": "generation",
+        })
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "co_scientist.mcp.server"],
+                input=payload, capture_output=True, text=True,
+                timeout=60, env=env, check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, f"failed to start: {e!r}"
+
+    tools: list[str] = []
+    for line in proc.stdout.splitlines():
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        listed = (msg.get("result") or {}).get("tools")
+        if isinstance(listed, list):
+            tools = [t.get("name", "?") for t in listed]
+    if not tools:
+        return False, (proc.stderr or "no tools/list response").strip()[:200]
+    return True, ", ".join(tools)
+
+
 @app.command()
 def version() -> None:
     """Print the co-scientist version."""
@@ -69,23 +165,27 @@ def init(ctx: typer.Context) -> None:
     asyncio.run(db_mod.init_db(cfg))
 
     # Report
-    env_var = provider_key_env(cfg)
+    from .config import has_embeddings_key
+    from .llm.provider import check_backend
+
+    status = check_backend(cfg)
     tbl = Table(title="Init complete", show_header=False, box=None)
     tbl.add_row("data dir", str(cfg.data_dir))
     tbl.add_row("database", str(cfg.db_path))
-    tbl.add_row("LLM provider", cfg.llm.provider)
+    tbl.add_row("backend", f"{status.backend} ({status.binary})")
+    tbl.add_row("CLI", status.version or "[red]not found[/red]")
+    tbl.add_row("subscription", "yes" if status.authenticated else "[red]no[/red]")
     tbl.add_row(
-        f"{env_var or '(keyless)'} set",
-        "yes" if has_llm_key(cfg) else "[red]no[/red]",
+        "embeddings",
+        f"{cfg.embeddings.model}" if has_embeddings_key(cfg)
+        else "[yellow]hash fallback (no OPENAI_API_KEY)[/yellow]",
     )
     tbl.add_row("science-skills", cfg.science_skills.path)
     console.print(tbl)
 
-    if not has_llm_key(cfg):
-        console.print(
-            f"[yellow]{env_var} is not set; set it (or change [llm] provider in your "
-            f"config) before running a session. See .env.example.[/yellow]"
-        )
+    if not status.ok:
+        console.print(f"[yellow]{status.detail}[/yellow]")
+        console.print("[dim]Run `co-scientist doctor` for the full check.[/dim]")
 
 
 @app.command(name="list")
@@ -196,10 +296,7 @@ def run(
 ) -> None:
     """Start a fresh research session. Generation → Reflection → Ranking tournament → Meta-review."""
     cfg, _ = ctx.obj
-    if not has_llm_key(cfg):
-        env_var = provider_key_env(cfg)
-        console.print(f"[red]{env_var} is not set (LLM provider = {cfg.llm.provider}). See .env.example.[/red]")
-        raise typer.Exit(1)
+    _require_backend(cfg)
 
     if budget_usd is not None:
         cfg.run.budget_usd = budget_usd
@@ -238,10 +335,7 @@ def resume(
 ) -> None:
     """Resume a paused or interrupted session."""
     cfg, _ = ctx.obj
-    if not has_llm_key(cfg):
-        env_var = provider_key_env(cfg)
-        console.print(f"[red]{env_var} is not set (LLM provider = {cfg.llm.provider}). See .env.example.[/red]")
-        raise typer.Exit(1)
+    _require_backend(cfg)
     from .agents.supervisor import Supervisor
 
     sup = Supervisor(cfg)
@@ -423,17 +517,17 @@ def bench_cmd(
     candidate: list[str] = typer.Option(
         None, "--candidate", "-c",
         help=(
-            "Repeat: label=provider:model[@mode]. Mode is `pipeline` "
+            "Repeat: label=backend:model[@mode]. Mode is `pipeline` "
             "(default) or `direct` (single raw LM call, no tools). e.g. "
-            "'gemini-flash=openrouter:google/gemini-3-flash-preview', "
-            "'flash-raw=openrouter:google/gemini-3-flash-preview@direct'."
+            "'opus=claude_cli:opus', "
+            "'opus-raw=claude_cli:opus@direct'."
         ),
     ),
     n: int = typer.Option(2, "--n", help="Hypotheses per candidate."),
     matches: int = typer.Option(2, "--matches", help="Tournament matches per pair."),
     judge: str | None = typer.Option(
         None, "--judge",
-        help="Judge as provider:model. Defaults to the preset's suggestion, else anthropic:claude-sonnet-4-6.",
+        help="Judge as backend:model. Defaults to the preset's suggestion, else claude_cli:sonnet.",
     ),
     goldset_label: str | None = typer.Option(
         None, "--goldset",
@@ -458,14 +552,15 @@ def bench_cmd(
     Quick start (paper repro):
       co-scientist bench "Identify hypotheses about X" \\
         --preset paper \\
-        --judge openrouter:google/gemini-3-flash-preview
+        --judge claude_cli:sonnet
 
     Custom candidates:
       co-scientist bench "Identify hypotheses about X" \\
-        -c gemini-flash=openrouter:google/gemini-3-flash-preview \\
-        -c gpt5=openai:gpt-5 \\
-        -c opus=anthropic:claude-opus-4-7 \\
-        --judge anthropic:claude-sonnet-4-6
+        -c opus=claude_cli:opus \\
+        -c sonnet=claude_cli:sonnet \\
+        -c sol=openai:gpt-5.6-sol \\
+        -c luna=openai:gpt-5.6-luna@direct \\
+        --judge claude_cli:sonnet
     """
     cfg, _ = ctx.obj
     from .bench import BenchCandidate, get_preset, run_bench
@@ -499,7 +594,7 @@ def bench_cmd(
         for entry in candidate:
             if "=" not in entry or ":" not in entry.split("=", 1)[1]:
                 console.print(
-                    f"[red]--candidate must look like label=provider:model[@mode], got {entry!r}[/red]"
+                    f"[red]--candidate must look like label=backend:model[@mode], got {entry!r}[/red]"
                 )
                 raise typer.Exit(2)
             label, rest = entry.split("=", 1)
@@ -547,9 +642,9 @@ def bench_cmd(
         )
         raise typer.Exit(2)
     if judge is None:
-        judge = "anthropic:claude-sonnet-4-6"
+        judge = "claude_cli:sonnet"
     if ":" not in judge:
-        console.print(f"[red]--judge must look like provider:model, got {judge!r}[/red]")
+        console.print(f"[red]--judge must look like backend:model, got {judge!r}[/red]")
         raise typer.Exit(2)
     judge_provider, judge_model = judge.split(":", 1)
 

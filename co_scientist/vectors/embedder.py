@@ -1,7 +1,10 @@
 """Embedding clients.
 
-Voyage primary (`voyage-3-large` by default), OpenAI fallback, hash-based
-fallback for runs where no embedding API is configured.
+Embeddings are the one hosted-model dependency this project still has: no
+agent CLI exposes an embedding endpoint, and Proximity/dedup needs real
+semantic vectors. OpenAI's `text-embedding-3-large` is primary; with no key
+configured we fall back to a local hash embedder so a session still runs
+(with weaker dedup) rather than failing.
 
 All clients return `np.ndarray` of shape (n, dim), L2-normalized so cosine
 similarity == inner product (we use FAISS `IndexFlatIP`).
@@ -43,45 +46,14 @@ def _l2_normalize(v: np.ndarray) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
-# Voyage
-
-
-class VoyageEmbedder:
-    def __init__(self, cfg: Config) -> None:
-        self.model = cfg.embeddings.model
-        self.dim = cfg.embeddings.dim
-        self._cfg = cfg
-
-    async def embed(self, texts: list[str]) -> np.ndarray:
-        if not texts:
-            return np.zeros((0, self.dim), dtype="float32")
-        api_key = self._cfg.secrets.VOYAGE_API_KEY or os.environ.get("VOYAGE_API_KEY")
-        if not api_key:
-            raise RuntimeError("VOYAGE_API_KEY not set; cannot use VoyageEmbedder")
-        # voyageai is sync; offload to a thread to keep the loop responsive.
-        import voyageai
-
-        client = voyageai.Client(api_key=api_key)
-
-        def _call() -> list[list[float]]:
-            res = client.embed(texts, model=self.model, input_type="document")
-            return res.embeddings
-
-        vecs = await asyncio.to_thread(_call)
-        arr = np.asarray(vecs, dtype="float32")
-        return _l2_normalize(arr)
-
-
-# --------------------------------------------------------------------------- #
-# OpenAI fallback
+# OpenAI
 
 
 class OpenAIEmbedder:
     def __init__(self, cfg: Config) -> None:
-        # Override dim if running OpenAI's text-embedding-3-small (1536) or -large (3072).
-        self.model = cfg.embeddings.model if cfg.embeddings.provider == "openai" else "text-embedding-3-small"
-        # text-embedding-3-small native dim is 1536, but the API supports a `dimensions` parameter
-        # to shrink. We keep the configured dim and pass it explicitly.
+        self.model = cfg.embeddings.model
+        # `text-embedding-3-large` is natively 3072-d; the API's `dimensions`
+        # parameter shrinks it, so we pass the configured dim explicitly.
         self.dim = cfg.embeddings.dim
         self._cfg = cfg
 
@@ -171,20 +143,10 @@ def _warn_once(key: str) -> None:
 def make_embedder(cfg: Config) -> Embedder:
     """Construct an embedder honoring `cfg.embeddings.provider`.
 
-    Auto-fallback chain: if the configured provider has no API key, fall
-    through Voyage → OpenAI → HashEmbedder so the system stays usable
-    even when no embeddings credentials are set (just with weaker
-    semantic quality in proximity / dedup).
+    With no `OPENAI_API_KEY` we fall back to `HashEmbedder` rather than
+    raising: a session with degraded dedup is far more useful than no session.
     """
     provider = cfg.embeddings.provider.lower()
-    if provider == "voyage":
-        if cfg.secrets.VOYAGE_API_KEY or os.environ.get("VOYAGE_API_KEY"):
-            return VoyageEmbedder(cfg)
-        if cfg.secrets.OPENAI_API_KEY or os.environ.get("OPENAI_API_KEY"):
-            _warn_once("voyage_key_missing_using_openai_embeddings")
-            return OpenAIEmbedder(cfg)
-        _warn_once("no_embedding_key_using_hash_fallback")
-        return HashEmbedder(cfg)
     if provider == "openai":
         if cfg.secrets.OPENAI_API_KEY or os.environ.get("OPENAI_API_KEY"):
             return OpenAIEmbedder(cfg)
@@ -192,7 +154,9 @@ def make_embedder(cfg: Config) -> Embedder:
         return HashEmbedder(cfg)
     if provider == "hash":
         return HashEmbedder(cfg)
-    raise ValueError(f"unknown embeddings provider: {provider}")
+    raise ValueError(
+        f"unknown embeddings provider: {provider!r} (expected 'openai' or 'hash')"
+    )
 
 
 def _reset_fallback_warned_for_tests() -> None:

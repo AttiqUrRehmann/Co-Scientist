@@ -1,6 +1,8 @@
 # AI Co-Scientist — default configuration
 # User overrides: ~/.co-scientist/config.toml or ./co-scientist.toml
-# Secrets: env vars only (ANTHROPIC_API_KEY, VOYAGE_API_KEY, TAVILY_API_KEY, ...)
+# Secrets: env vars only, and none of them are for an LLM. Reasoning runs on
+# the Claude Code / Codex CLIs under your existing subscription; the only keys
+# are OPENAI_API_KEY (embeddings) and TAVILY/BRAVE/NCBI (data sources).
 
 [run]
 concurrency = 4
@@ -8,6 +10,10 @@ max_ideas = 60
 max_matches_per_idea = 12
 wall_clock_seconds = 7200            # 2h default
 budget_tokens = 5_000_000
+# Not a spend gate: a subscription has no marginal per-call price. The CLI
+# reports an equivalent API cost per call and this caps that gauge, which is
+# still useful for spotting a runaway session. Real limits are
+# wall_clock_seconds and max_ideas.
 budget_usd = 25.0
 
 [storage]
@@ -17,10 +23,13 @@ data_dir = "./data"
 path = "./vendor/science-skills"
 pinned_commit = ""                   # set after first clone
 
+# The one hosted-model dependency left: no agent CLI exposes an embedding
+# endpoint. Without OPENAI_API_KEY this degrades to a local hash embedder,
+# which keeps dedup running but only catches literal token overlap.
 [embeddings]
-provider = "voyage"                  # voyage | openai
-model = "voyage-3-large"
-dim = 1024
+provider = "openai"                  # openai | hash
+model = "text-embedding-3-large"
+dim = 3072
 
 [vectors]
 backend = "faiss"
@@ -68,21 +77,25 @@ metareview = 0.10
 proximity  = 0.02
 reserve    = 0.08
 
+# Passed verbatim to the backend's --model flag: CLI aliases under
+# claude_cli ("opus" / "sonnet" / "haiku"), Codex model ids under codex_cli.
 [models]
-parse_goal          = "claude-sonnet-4-6"
-generation          = "claude-opus-4-7"
-reflection          = "claude-opus-4-7"
-evolution           = "claude-opus-4-7"
-ranking_pairwise    = "claude-sonnet-4-6"
-ranking_debate      = "claude-sonnet-4-6"
-ranking_priority    = "claude-opus-4-7"
-metareview_feedback = "claude-sonnet-4-6"
-metareview_final    = "claude-opus-4-7"
-classifier          = "claude-haiku-4-5-20251001"
-judge               = "claude-sonnet-4-6"
+parse_goal          = "sonnet"
+generation          = "opus"
+reflection          = "opus"
+evolution           = "opus"
+ranking_pairwise    = "sonnet"
+ranking_debate      = "sonnet"
+ranking_priority    = "opus"
+metareview_feedback = "sonnet"
+metareview_final    = "opus"
+classifier          = "haiku"
+judge               = "sonnet"
 
 [thinking]
-# per agent.mode budgets; 0 = disabled
+# Per agent.mode reasoning budgets; 0 = disabled. The CLIs take discrete
+# effort tiers rather than token budgets, so these map onto
+# --effort low/medium/high/xhigh/max (see cli_backend/claude_code.py).
 generation_literature   = 4000
 generation_debate       = 8000
 reflection_full         = 0
@@ -97,6 +110,10 @@ evolution_simplify      = 0
 metareview_feedback     = 8000
 metareview_final        = 16000
 
+# The CLI backends run their own agentic loop, so *_max_iters no longer
+# counts turns we drive — it caps how many times we re-ask for a structured
+# record when the agent finishes without one. parallel_cap and
+# tool_timeout_seconds are enforced inside the MCP tool server.
 [tool_loop]
 generation_max_iters = 8
 reflection_max_iters = 8
@@ -106,8 +123,10 @@ metareview_max_iters = 12
 parallel_cap         = 4
 tool_timeout_seconds = 30
 
+# Subprocess retry. max_attempts_429 is the attempt budget; rate-limit
+# backoff is floored at 30s and allowed to reach 10min, because a
+# subscription limit clears over hours, not seconds.
 [retry]
-# Anthropic API
 max_attempts_429 = 6
 max_attempts_529 = 8
 max_attempts_5xx = 5
@@ -134,7 +153,7 @@ timeout_seconds = 30
 user_agent = "co-scientist/0.1 (+research; contact via project README)"
 
 [code_exec]
-provider = "anthropic"               # anthropic | local
+provider = "local"
 local_cpu_seconds = 30
 local_mem_mb = 512
 
@@ -144,39 +163,32 @@ enable_citation_verifier = true
 classifier_block_categories = ["cbrn", "csam", "weapons", "illicit_synthesis"]
 classifier_warn_categories = ["dual_use_bio"]
 
-# LLM provider selection. Choose one of:
-#   "anthropic"  — Claude via the official SDK (default). Full feature set:
-#                  cache breakpoints, extended thinking, batch API.
-#   "openai"     — OpenAI Chat Completions (api.openai.com). Reasoning
-#                  translated to `reasoning_effort` on o-series models.
-#   "openrouter" — openrouter.ai (200+ models from every major vendor).
-#                  Set OPENROUTER_API_KEY. Models like
-#                  "anthropic/claude-3.5-sonnet", "openai/gpt-5",
-#                  "google/gemini-2.5-pro", "meta-llama/llama-3.3-70b".
-#   "gemini"     — Google Gemini via OpenAI-compat endpoint. Set
-#                  GEMINI_API_KEY. Models: "gemini-2.5-pro",
-#                  "gemini-2.5-flash", "gemini-1.5-pro".
-#   "groq"       — Groq (fast Llama / Mixtral). Set GROQ_API_KEY.
-#   "together"   — Together AI. Set TOGETHER_API_KEY.
-#   "mistral"    — Mistral la-plateforme. Set MISTRAL_API_KEY.
-#   "ollama"     — Local Ollama at http://localhost:11434/v1 (no key needed).
-#   "openai_compatible" — Any other OpenAI-compatible endpoint; set
-#                  [llm.openai] base_url to point at it.
-#
-# After choosing a provider, set the entries in [models] to model ids it
-# can serve.
+# Backend selection. Both drive a locally-installed agent CLI over its
+# subscription login — there is no API-key path.
+#   "claude_cli" — `claude -p` (Claude Code). Models: "opus", "sonnet",
+#                  "haiku".
+#   "codex_cli"  — `codex exec` (Codex). Models are Codex model ids; your
+#                  ChatGPT account must be entitled to the one you pick.
 [llm]
-provider = "anthropic"
+provider = "claude_cli"
 
-# For provider = "openai" / "openai_compatible" / any preset above: this
-# overrides the preset's base_url (rarely needed).
-[llm.openai]
-# base_url = ""
+[llm.claude_cli]
+binary = "claude"
+permission_mode = "dontAsk"
+timeout_seconds = 900
+# Concurrent CLI processes. Bounded by the subscription rate limit rather
+# than by CPU, so keep it below [run] concurrency.
+max_parallel = 3
+# Replace Claude Code's default system prompt instead of appending to it.
+# Appending costs ~19k cache-creation + ~24k cache-read tokens per call in
+# harness scaffolding the agents do not need.
+replace_system_prompt = true
 
-# OpenRouter attribution (optional; for catalog ranking).
-[llm.openrouter]
-# referer = "https://your-app.example.com"
-# title   = "My Co-Scientist App"
+[llm.codex_cli]
+binary = "codex"
+sandbox = "read-only"
+timeout_seconds = 900
+max_parallel = 3
 
 [web_ui]
 host = "127.0.0.1"

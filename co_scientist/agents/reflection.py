@@ -10,10 +10,10 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .. import ids
-from ..llm.anthropic_client import AgentCallSpec, CachedBlock, CallContext
 from ..llm.prompts import render
 from ..llm.routing import route
 from ..llm.tool_loop import ToolLoopExhausted, run_tool_loop
+from ..llm.types import AgentCallSpec, CachedBlock, CallContext
 from ..models import Review, ReviewScores, Task, TaskResult
 from ..safety.quoting import quote_hypothesis
 from ..storage.artifacts import write_json

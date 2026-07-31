@@ -1,55 +1,80 @@
-"""Tests for the tool-use loop, especially terminal-tool short-circuit.
+"""Tests for the tool-loop adapter over a CLI backend's own agentic loop.
 
-The terminal-tool short-circuit matters for any provider whose model does NOT
-reliably emit `stop_reason="end_turn"` after calling a recording tool — that
-includes most OpenAI-compat models (Gemini, OpenAI o-series via tool_calls,
-Llama through OpenRouter, etc.). Without the short-circuit they loop until
-max_iters and ToolLoopExhausted, even though a perfectly valid record was
-emitted on the first call.
+The adapter no longer drives turns — the CLI does that internally. What it
+must still guarantee is the contract the agents depend on: a structured
+record comes back, tool provenance is preserved, and a call that produces no
+record is retried once and then fails loudly rather than silently returning
+prose.
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any
 
 import pytest
 
-from co_scientist.llm.anthropic_client import (
+from co_scientist.llm.routing import ModelRoute
+from co_scientist.llm.tool_loop import ToolLoopExhausted, run_tool_loop
+from co_scientist.llm.types import (
     AgentCallSpec,
-    AnthropicResponse,
     CachedBlock,
     CallContext,
+    CaptureBundle,
+    LLMResponse,
+    SynthMessage,
+    TextBlock,
+    ToolUseBlock,
 )
-from co_scientist.llm.routing import ModelRoute
-from co_scientist.llm.tool_loop import run_tool_loop
+
+RECORD_TOOL = {"name": "record_hypothesis", "description": "", "input_schema": {}}
+SEARCH_TOOL = {"name": "pubmed_search", "description": "", "input_schema": {}}
 
 
-def _fake_response(*, stop_reason: str, blocks: list[dict]) -> AnthropicResponse:
-    """Build an AnthropicResponse whose .raw quacks like an anthropic Message."""
-    content = []
-    for b in blocks:
-        # Each block must expose .type, .name, .input, .text
-        content.append(SimpleNamespace(
-            type=b.get("type", "text"),
-            name=b.get("name", ""),
-            input=b.get("input", {}),
-            text=b.get("text", ""),
-            id=b.get("id", ""),
-        ))
-    raw = SimpleNamespace(stop_reason=stop_reason, content=content)
-    return AnthropicResponse(
-        raw=raw, transcript_id="trn_x",
-        cost_usd=0.0, input_tokens=0, output_tokens=0,
+class FakeProvider:
+    """Returns a scripted response per call and records the specs it saw."""
+
+    def __init__(self, responses: list[LLMResponse]) -> None:
+        self._responses = responses
+        self.specs: list[AgentCallSpec] = []
+
+    async def call(
+        self, spec: AgentCallSpec, ctx: CallContext, *, est_input_tokens: int | None = None
+    ) -> LLMResponse:
+        self.specs.append(spec)
+        return self._responses[min(len(self.specs) - 1, len(self._responses) - 1)]
+
+
+def _response(
+    *,
+    records: list[tuple[str, dict[str, Any]]] | None = None,
+    tool_calls: list[dict[str, Any]] | None = None,
+    urls: set[str] | None = None,
+    text: str = "done",
+    num_turns: int = 3,
+) -> LLMResponse:
+    records = records or []
+    capture = CaptureBundle(
+        records=records,
+        tool_calls=tool_calls or [],
+        seen_urls=urls or set(),
+    )
+    content: list[Any] = [TextBlock(text=text)]
+    content += [ToolUseBlock(name=n, input=p, id=f"c{i}") for i, (n, p) in enumerate(records)]
+    return LLMResponse(
+        raw=SynthMessage(content=content),
+        transcript_id="trn_x",
+        cost_usd=0.0, input_tokens=10, output_tokens=5,
         cache_read=0, cache_write=0,
+        num_turns=num_turns,
+        capture=capture,
     )
 
 
-def _spec() -> AgentCallSpec:
+def _spec(tools: list[dict[str, Any]] | None = None) -> AgentCallSpec:
     return AgentCallSpec(
-        route=ModelRoute(agent="generation", mode="literature", model="x"),
+        route=ModelRoute(agent="generation", mode="literature", model="opus"),
         user_blocks=[CachedBlock("go")],
-        tools=[{"name": "search", "description": "", "input_schema": {}}],
+        tools=tools if tools is not None else [SEARCH_TOOL, RECORD_TOOL],
         max_output_tokens=512,
     )
 
@@ -58,166 +83,124 @@ def _ctx() -> CallContext:
     return CallContext(session_id="s", task_id="t", agent="generation", action="a")
 
 
-@pytest.mark.asyncio
-async def test_loop_ends_on_record_hypothesis_even_when_stop_reason_is_tool_use() -> None:
-    """The bug we hit on Gemini: model emits record_hypothesis but keeps
-    stop_reason=tool_use, so without short-circuit the loop runs to
-    max_iters."""
-    client = MagicMock()
-    client.call = AsyncMock(side_effect=[
-        _fake_response(
-            stop_reason="tool_use",
-            blocks=[{
-                "type": "tool_use",
-                "id": "call_1",
-                "name": "record_hypothesis",
-                "input": {"title": "t", "statement": "s"},
-            }],
-        ),
-    ])
-    registry = MagicMock()
-
-    result = await run_tool_loop(
-        client, spec=_spec(), ctx=_ctx(), registry=registry,
-        max_iters=8, parallel_cap=4, tool_timeout_s=1.0,
+async def _run(provider: FakeProvider, spec: AgentCallSpec, **kw: Any):
+    return await run_tool_loop(
+        provider, spec=spec, ctx=_ctx(), registry=None, max_iters=8, **kw,
     )
-    assert result.iterations == 1
-    # The terminal tool_use is logged but never dispatched.
-    assert client.call.await_count == 1
-    assert result.tool_calls[0]["name"] == "record_hypothesis"
 
 
-@pytest.mark.asyncio
-async def test_loop_ends_normally_on_end_turn() -> None:
-    client = MagicMock()
-    client.call = AsyncMock(return_value=_fake_response(
-        stop_reason="end_turn",
-        blocks=[{"type": "text", "text": "all done"}],
-    ))
-    registry = MagicMock()
-    result = await run_tool_loop(
-        client, spec=_spec(), ctx=_ctx(), registry=registry,
-        max_iters=8, parallel_cap=4, tool_timeout_s=1.0,
-    )
-    assert result.iterations == 1
+# --------------------------------------------------------------------------- #
 
 
-@pytest.mark.asyncio
-async def test_loop_dispatches_non_terminal_tools_then_continues() -> None:
-    """Search tool calls should still be dispatched and the loop continues."""
-    from co_scientist.tools.base import ToolResult
+async def test_returns_immediately_when_a_record_is_captured() -> None:
+    provider = FakeProvider([_response(records=[("record_hypothesis", {"title": "T"})])])
 
-    client = MagicMock()
-    client.call = AsyncMock(side_effect=[
-        _fake_response(
-            stop_reason="tool_use",
-            blocks=[{
-                "type": "tool_use", "id": "call_search",
-                "name": "search", "input": {"q": "foo"},
-            }],
-        ),
-        _fake_response(
-            stop_reason="tool_use",
-            blocks=[{
-                "type": "tool_use", "id": "call_record",
-                "name": "record_hypothesis",
-                "input": {"title": "t", "statement": "s"},
-            }],
-        ),
+    result = await _run(provider, _spec())
+
+    assert len(provider.specs) == 1
+    assert result.response.num_turns == 3
+    assert [c["name"] for c in result.tool_calls] == ["record_hypothesis"]
+
+
+async def test_iterations_reflect_the_backends_own_turn_count() -> None:
+    """The CLI runs the loop, so `iterations` reports its turns, not ours."""
+    provider = FakeProvider([
+        _response(records=[("record_hypothesis", {})], num_turns=7)
     ])
 
-    registry = MagicMock()
-    registry._cfg = SimpleNamespace()
-    registry.call = AsyncMock(return_value=ToolResult(
-        is_error=False, content={"ok": True}, duration_ms=1,
-    ))
+    result = await _run(provider, _spec())
 
-    result = await run_tool_loop(
-        client, spec=_spec(), ctx=_ctx(), registry=registry,
-        max_iters=8, parallel_cap=4, tool_timeout_s=1.0,
-    )
-    assert result.iterations == 2
-    # search was dispatched; record_hypothesis was NOT (terminal)
-    assert registry.call.await_count == 1
-    names = [tc["name"] for tc in result.tool_calls]
-    assert names == ["search", "record_hypothesis"]
+    assert result.iterations == 7
 
 
-@pytest.mark.asyncio
-async def test_loop_terminates_on_record_review() -> None:
-    client = MagicMock()
-    client.call = AsyncMock(return_value=_fake_response(
-        stop_reason="tool_use",
-        blocks=[{
-            "type": "tool_use", "id": "c", "name": "record_review",
-            "input": {"verdict": "accept"},
-        }],
-    ))
-    result = await run_tool_loop(
-        client, spec=_spec(), ctx=_ctx(), registry=MagicMock(),
-        max_iters=8, parallel_cap=4, tool_timeout_s=1.0,
-    )
-    assert result.iterations == 1
+async def test_tool_provenance_and_urls_survive() -> None:
+    provider = FakeProvider([_response(
+        records=[("record_hypothesis", {"title": "T"})],
+        tool_calls=[{"name": "pubmed_search", "args": {"q": "x"},
+                     "is_error": False, "duration_ms": 12}],
+        urls={"https://pubmed.example/1"},
+    )])
+
+    result = await _run(provider, _spec())
+
+    assert result.seen_urls == {"https://pubmed.example/1"}
+    names = [c["name"] for c in result.tool_calls]
+    assert names == ["pubmed_search", "record_hypothesis"]
 
 
-@pytest.mark.asyncio
-async def test_loop_terminates_on_custom_terminal_tool() -> None:
-    """The terminal-tool set is configurable via kwarg."""
-    client = MagicMock()
-    client.call = AsyncMock(return_value=_fake_response(
-        stop_reason="tool_use",
-        blocks=[{"type": "tool_use", "id": "c", "name": "my_done_signal", "input": {}}],
-    ))
-    result = await run_tool_loop(
-        client, spec=_spec(), ctx=_ctx(), registry=MagicMock(),
-        max_iters=8, parallel_cap=4, tool_timeout_s=1.0,
-        terminal_tool_names=("my_done_signal",),
-    )
-    assert result.iterations == 1
+async def test_missing_record_triggers_exactly_one_escalated_retry() -> None:
+    provider = FakeProvider([
+        _response(records=[], text="I searched a lot but did not commit."),
+        _response(records=[("record_hypothesis", {"title": "finally"})]),
+    ])
 
+    result = await _run(provider, _spec())
 
-@pytest.mark.asyncio
-async def test_force_terminal_tool_on_final_iteration() -> None:
-    """A model that only ever searches should be forced to record on the last
-    iteration when force_terminal_tool is set — instead of exhausting the loop."""
-    from co_scientist.tools.base import ToolResult
-
-    # The model keeps searching forever unless tool_choice forces a specific
-    # tool — exactly how a real provider behaves under a forced tool_choice.
-    def _respect_tool_choice(spec, *_a, **_k):
-        tc = spec.tool_choice or {}
-        if tc.get("type") == "tool" and tc.get("name") == "record_hypothesis":
-            return _fake_response(
-                stop_reason="tool_use",
-                blocks=[{
-                    "type": "tool_use", "id": "r", "name": "record_hypothesis",
-                    "input": {"title": "t", "statement": "s"},
-                }],
-            )
-        return _fake_response(
-            stop_reason="tool_use",
-            blocks=[{"type": "tool_use", "id": "s", "name": "search", "input": {"q": "x"}}],
-        )
-
-    client = MagicMock()
-    client.call = AsyncMock(side_effect=_respect_tool_choice)
-    registry = MagicMock()
-    registry._cfg = SimpleNamespace()
-    registry.call = AsyncMock(return_value=ToolResult(
-        is_error=False, content={"n": 0, "results": []}, duration_ms=1,
-    ))
-
-    result = await run_tool_loop(
-        client, spec=_spec(), ctx=_ctx(), registry=registry,
-        max_iters=3, parallel_cap=4, tool_timeout_s=1.0,
-        force_terminal_tool="record_hypothesis",
-    )
-    # The loop committed on the forced final iteration instead of exhausting.
-    assert result.iterations == 3
+    assert len(provider.specs) == 2
     assert result.tool_calls[-1]["name"] == "record_hypothesis"
-    # The final (3rd) call forced tool_choice to record_hypothesis.
-    final_spec = client.call.await_args_list[-1].args[0]
-    assert final_spec.tool_choice == {"type": "tool", "name": "record_hypothesis"}
-    # Earlier calls used the original auto tool_choice (no forcing).
-    first_spec = client.call.await_args_list[0].args[0]
-    assert first_spec.tool_choice != {"type": "tool", "name": "record_hypothesis"}
+
+
+async def test_escalation_demands_the_record_and_drops_search_tools() -> None:
+    """The failure being recovered from is 'kept searching, never committed'."""
+    provider = FakeProvider([
+        _response(records=[]),
+        _response(records=[("record_hypothesis", {})]),
+    ])
+
+    await _run(provider, _spec())
+
+    retry_spec = provider.specs[1]
+    assert [t["name"] for t in retry_spec.tools] == ["record_hypothesis"]
+    assert retry_spec.tool_choice == {"type": "tool", "name": "record_hypothesis"}
+    assert "did not commit" not in retry_spec.user_blocks[-1].text
+    assert "call" in retry_spec.user_blocks[-1].text.lower()
+    assert "record_hypothesis" in retry_spec.user_blocks[-1].text
+
+
+async def test_persistent_failure_to_record_raises_exhausted() -> None:
+    provider = FakeProvider([_response(records=[]), _response(records=[])])
+
+    with pytest.raises(ToolLoopExhausted) as e:
+        await _run(provider, _spec())
+
+    assert e.value.agent == "generation"
+
+
+async def test_calls_that_expect_no_record_return_prose_without_retrying() -> None:
+    """Ranking's debate turns have no record_* tool and must not be retried."""
+    provider = FakeProvider([_response(records=[], text="better idea: 1")])
+
+    result = await _run(provider, _spec(tools=[]))
+
+    assert len(provider.specs) == 1
+    assert "better idea" in result.response.raw.content[0].text
+
+
+async def test_force_terminal_tool_selects_the_escalation_target() -> None:
+    provider = FakeProvider([
+        _response(records=[]),
+        _response(records=[("record_review", {})]),
+    ])
+    spec = _spec(tools=[
+        SEARCH_TOOL,
+        {"name": "record_review", "description": "", "input_schema": {}},
+    ])
+
+    await _run(provider, spec, force_terminal_tool="record_review")
+
+    assert provider.specs[1].tool_choice == {"type": "tool", "name": "record_review"}
+
+
+async def test_response_without_capture_is_tolerated() -> None:
+    """A backend that reports no capture must not crash the adapter."""
+    resp = LLMResponse(
+        raw=SynthMessage(content=[TextBlock(text="hi")]),
+        transcript_id="t", cost_usd=0.0, input_tokens=0, output_tokens=0,
+        cache_read=0, cache_write=0, capture=None,
+    )
+    provider = FakeProvider([resp])
+
+    result = await _run(provider, _spec(tools=[]))
+
+    assert result.tool_calls == []
+    assert result.seen_urls == set()

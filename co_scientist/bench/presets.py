@@ -3,31 +3,26 @@
 Curated comparison setups so users can reproduce known benchmarks with one
 flag instead of typing N `--candidate` lines.
 
-Substitutions in the "paper" preset
------------------------------------
-The Google Co-Scientist paper compared their system against:
+What changed with the move to subscription CLIs
+-----------------------------------------------
+The historical `paper` presets compared the system against the Co-Scientist
+paper's baselines (Gemini 2.0 Flash Thinking Experimental, Gemini 2.0 Pro
+Experimental, OpenAI o1) by routing every candidate through OpenRouter. That
+is no longer possible: candidates now run through an agent CLI on a
+subscription, and no CLI serves third-party models. Those presets are gone
+rather than silently broken.
 
-    Gemini 2.0 Flash Thinking Experimental 12-19
-    Gemini 2.0 Pro Experimental
-    OpenAI o1
+The archived cross-vendor numbers in `docs/BENCH_RESULTS.md` were produced
+under the previous API-key architecture and are kept for reference. They are
+not reproducible with this code, and are not comparable to new runs: the
+prompts still match, but the harness now delegates the tool loop to the CLI.
 
-across 15 expert-curated research goals. Of those, OpenRouter currently
-serves only `openai/o1`; the experimental Gemini 2.0 Thinking and Pro
-Experimental branches were retired. We substitute the closest current
-analogues and document the swap so reported numbers are interpretable:
+What survives is the science: the paper's AML drug-repurposing goal and its
+top-3 gold set, which are the genuinely reusable part. Candidates are now
+models the local CLIs can actually serve.
 
-    paper-baseline                            current substitute
-    ----------------------------------------  --------------------------------
-    Gemini 2.0 Flash Thinking Experimental    google/gemini-2.0-flash-001
-       (Thinking branch deprecated; production 2.0 Flash is the closest)
-    Gemini 2.0 Pro Experimental               google/gemini-2.5-pro
-       (2.0 Pro Experimental removed; 2.5 Pro is the current Pro-tier Gemini)
-    OpenAI o1                                 openai/o1               (exact)
-    Claude Haiku (added by user request)      anthropic/claude-haiku-4.5
-
-Judge model is left configurable via --judge so users can pick a different
-referee. The recommended default for this preset is
-`openrouter:google/gemini-3-flash-preview`.
+Judge model is configurable via --judge as "<backend>:<model>". The
+recommended default is `claude_cli:sonnet`.
 """
 
 from __future__ import annotations
@@ -50,27 +45,12 @@ class BenchPreset:
     goldset: GoldSet | None = None
 
 
-_PAPER_CANDIDATES: tuple[BenchCandidate, ...] = (
-    BenchCandidate(
-        label="gemini-2-flash-thinking",
-        provider="openrouter",
-        model="google/gemini-2.0-flash-001",
-    ),
-    BenchCandidate(
-        label="gemini-2-pro",
-        provider="openrouter",
-        model="google/gemini-2.5-pro",
-    ),
-    BenchCandidate(
-        label="openai-o1",
-        provider="openrouter",
-        model="openai/o1",
-    ),
-    BenchCandidate(
-        label="claude-haiku-4.5",
-        provider="openrouter",
-        model="anthropic/claude-haiku-4.5",
-    ),
+# Claude Code tiers. Spans the capability range so the bench still surfaces
+# a quality gradient, even though nothing is billed per token any more.
+_CLAUDE_CANDIDATES: tuple[BenchCandidate, ...] = (
+    BenchCandidate(label="opus", provider="claude_cli", model="opus"),
+    BenchCandidate(label="sonnet", provider="claude_cli", model="sonnet"),
+    BenchCandidate(label="haiku", provider="claude_cli", model="haiku"),
 )
 
 
@@ -129,87 +109,56 @@ def _vs_raw(candidates: tuple[BenchCandidate, ...]) -> tuple[BenchCandidate, ...
     return tuple(out)
 
 
-# Current frontier set — what you'd actually want to use today. Picked to
-# span pricing tiers so the bench surfaces $/quality tradeoffs, not just
-# raw quality.
-_FRONTIER_CANDIDATES: tuple[BenchCandidate, ...] = (
-    BenchCandidate(
-        label="claude-opus-4.7",
-        provider="openrouter",
-        # OpenRouter uses dots in the version suffix.
-        model="anthropic/claude-opus-4.7",
-    ),
-    BenchCandidate(
-        label="gpt-5",
-        provider="openrouter",
-        model="openai/gpt-5",
-    ),
-    BenchCandidate(
-        label="gemini-3-pro",
-        provider="openrouter",
-        model="google/gemini-3.1-pro-preview",
-    ),
-    BenchCandidate(
-        label="gemini-3-flash",
-        provider="openrouter",
-        model="google/gemini-3-flash-preview",
-    ),
+# Cross-backend set. Codex requires a ChatGPT account entitled to the model —
+# check with `codex exec -m <model>` before running this preset, since an
+# unentitled model fails the run rather than degrading.
+_CROSS_BACKEND_CANDIDATES: tuple[BenchCandidate, ...] = (
+    BenchCandidate(label="claude-opus", provider="claude_cli", model="opus"),
+    BenchCandidate(label="claude-sonnet", provider="claude_cli", model="sonnet"),
+    BenchCandidate(label="codex", provider="codex_cli", model="gpt-5.6-codex"),
 )
 
 
 PRESETS: dict[str, BenchPreset] = {
-    "paper": BenchPreset(
-        name="paper",
+    "claude-aml": BenchPreset(
+        name="claude-aml",
         description=(
-            "Reproduce the Co-Scientist paper's preference-ranking comparison "
-            "(plus Haiku) using current OpenRouter models. See module docstring "
-            "for the substitutions we had to make for retired experimental models."
+            "The paper's AML repurposing benchmark under its strict "
+            "methodology: candidates with NO prior repurposing evidence and "
+            "NO preclinical evidence in AML, no external inputs (DepMap, "
+            "expert feedback). Recall is scored against the top-3 candidates "
+            "the paper surfaced: Nanvuranlat, KIRA6, and Leflunomide. Runs "
+            "the three Claude Code tiers."
         ),
-        candidates=_PAPER_CANDIDATES,
-        suggested_judge="openrouter:google/gemini-3-flash-preview",
-    ),
-    "paper-aml": BenchPreset(
-        name="paper-aml",
-        description=(
-            "Reproduce the paper's AML repurposing benchmark under its "
-            "strict methodology: candidates with NO prior repurposing "
-            "evidence and NO preclinical evidence in AML, no external "
-            "inputs (DepMap, expert feedback). Recall is scored against "
-            "the top-3 candidates the paper surfaced: Nanvuranlat, KIRA6, "
-            "and Leflunomide. Uses the same candidate set + judge as the "
-            "`paper` preset."
-        ),
-        candidates=_PAPER_CANDIDATES,
-        suggested_judge="openrouter:google/gemini-3-flash-preview",
+        candidates=_CLAUDE_CANDIDATES,
+        suggested_judge="claude_cli:sonnet",
         default_goal=_PAPER_AML_GOAL,
         goldset=AML_REPURPOSING_PAPER_TOP3,
     ),
-    "paper-aml-vs-raw": BenchPreset(
-        name="paper-aml-vs-raw",
+    "claude-aml-vs-raw": BenchPreset(
+        name="claude-aml-vs-raw",
         description=(
-            "AML repurposing benchmark for the paper's baseline models, "
-            "under the strict no-prior-evidence methodology — each model "
-            "runs TWICE: once through the full co-scientist Generation "
-            "pipeline (literature tools + tool loop + dedup) and once as a "
-            "single raw LM call. Isolates how much of the system's "
-            "performance comes from the multi-agent harness vs the model "
-            "itself. Same top-3 gold set as `paper-aml`."
+            "AML repurposing benchmark where each Claude tier runs TWICE: "
+            "once through the full co-scientist Generation pipeline "
+            "(literature tools + dedup) and once as a single raw call. "
+            "Isolates how much performance comes from the multi-agent "
+            "harness versus the model itself. Same gold set as `claude-aml`."
         ),
-        candidates=_vs_raw(_PAPER_CANDIDATES),
-        suggested_judge="openrouter:google/gemini-3-flash-preview",
+        candidates=_vs_raw(_CLAUDE_CANDIDATES),
+        suggested_judge="claude_cli:sonnet",
         default_goal=_PAPER_AML_GOAL,
         goldset=AML_REPURPOSING_PAPER_TOP3,
     ),
-    "frontier-aml-vs-raw": BenchPreset(
-        name="frontier-aml-vs-raw",
+    "cross-backend-aml": BenchPreset(
+        name="cross-backend-aml",
         description=(
-            "Same setup as `paper-aml-vs-raw` but with current frontier "
-            "models (Claude Opus 4.7, GPT-5, Gemini 3 Pro, Gemini 3 Flash). "
-            "Lets you see whether the multi-agent harness still adds value "
-            "with stronger base models."
+            "Claude Code versus Codex on the AML repurposing benchmark. "
+            "Requires both CLIs installed and signed in, and a ChatGPT "
+            "account entitled to the Codex model — verify with "
+            "`co-scientist doctor` after setting [llm] provider = codex_cli."
         ),
-        candidates=_vs_raw(_FRONTIER_CANDIDATES),
-        suggested_judge="openrouter:google/gemini-3-flash-preview",
+        candidates=_CROSS_BACKEND_CANDIDATES,
+        suggested_judge="claude_cli:sonnet",
         default_goal=_PAPER_AML_GOAL,
         goldset=AML_REPURPOSING_PAPER_TOP3,
     ),

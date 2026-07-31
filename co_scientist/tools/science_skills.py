@@ -272,12 +272,11 @@ _ALLOWED_ENV_KEYS = {
     "LANG",
     "LC_ALL",
     "PYTHONPATH",
-    # API keys downstream scripts might need
-    "ANTHROPIC_API_KEY",
+    # Data-source keys a downstream script might need. Note the absence of any
+    # LLM key: skills are data tools, and forwarding one would reintroduce
+    # metered billing through the back door.
     "NCBI_API_KEY",
     "OPENALEX_API_KEY",
-    "OPENAI_API_KEY",
-    "VOYAGE_API_KEY",
     "TAVILY_API_KEY",
     "BRAVE_API_KEY",
 }
@@ -293,9 +292,6 @@ def _sanitized_env(cfg: Config, extra_required: list[str]) -> dict[str, str]:
             env[k] = v
     # also export any secrets present on the cfg.secrets object
     for sk in (
-        "ANTHROPIC_API_KEY",
-        "VOYAGE_API_KEY",
-        "OPENAI_API_KEY",
         "TAVILY_API_KEY",
         "BRAVE_API_KEY",
         "NCBI_API_KEY",

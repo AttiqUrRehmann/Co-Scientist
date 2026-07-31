@@ -1,38 +1,26 @@
-"""LLMProvider — vendor-agnostic LLM client interface.
+"""LLMProvider — the interface every backend implements, and its factory.
 
-The co-scientist began as an Anthropic-only system; the type hints and
-intermediate request shapes (`AgentCallSpec`, `CachedBlock`) are
-Anthropic-flavored. Rather than rewrite every agent we treat those types as
-the canonical normalized form: each provider takes a normalized spec, calls
-its vendor SDK, and returns an `AnthropicResponse` whose `.raw` exposes a
-Message-like object with `.content`, `.stop_reason`, `.usage`.
+There is exactly one kind of backend now: a local agent CLI driven over its
+subscription login. No API keys, no metered per-token billing, no vendor SDKs
+in the request path.
 
-Concretely:
-- AnthropicProvider: passes through to anthropic.AsyncAnthropic.messages.create.
-- OpenAIProvider: translates to openai.chat.completions.create (also supports
-  arbitrary OpenAI-compatible base_urls: Groq, Together, OpenRouter, Mistral,
-  Ollama, Gemini OpenAI-compat endpoint).
-
-Provider-specific features:
-- cache_control: honored only on Anthropic. Stripped before sending elsewhere.
-- thinking / extended reasoning: Anthropic for Claude opus; on OpenAI we
-  translate to `reasoning_effort` for o-series models, else drop.
-- batch API: Anthropic only; the BatchPool still talks to Anthropic directly.
-
-Users select a provider in `[llm] provider = "..."` and per-agent models in
-`[models]`. Model strings are passed verbatim to the configured provider.
+Backends take a normalized `AgentCallSpec` and return an `LLMResponse` whose
+`.raw` is Anthropic-Message-shaped (`.content` blocks, `.stop_reason`,
+`.usage`) — see `llm/types.py` for why that shape is the contract.
 """
 
 from __future__ import annotations
 
+import shutil
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from .anthropic_client import AgentCallSpec, AnthropicResponse, CallContext
+from .types import AgentCallSpec, CallContext, LLMResponse
 
 
 @runtime_checkable
 class LLMProvider(Protocol):
-    """Common interface every LLM client implements."""
+    """Common interface every backend implements."""
 
     async def call(
         self,
@@ -40,141 +28,147 @@ class LLMProvider(Protocol):
         ctx: CallContext,
         *,
         est_input_tokens: int | None = None,
-    ) -> AnthropicResponse:
+    ) -> LLMResponse:
         ...
 
 
-# Provider names accepted in config.
-KNOWN_PROVIDERS = frozenset({
-    "anthropic",
-    "openai",
-    "openai_compatible",
-    "openrouter",
-    "gemini",
-    "google",         # alias for "gemini"
-    "groq",           # convenience preset
-    "together",       # convenience preset
-    "mistral",        # convenience preset
-    "ollama",         # convenience preset
+# Backend names accepted in `[llm] provider`.
+KNOWN_BACKENDS = frozenset({"claude_cli", "codex_cli"})
+
+# Names that used to select a metered API provider. Kept only to give a
+# pointed error instead of a confusing fallback when an old config is loaded.
+RETIRED_API_PROVIDERS = frozenset({
+    "anthropic", "openai", "openai_compatible", "openrouter",
+    "gemini", "google", "groq", "together", "mistral", "ollama",
 })
 
 
-# Built-in presets for OpenAI-compatible endpoints. `api_key_env` is the
-# environment variable / cfg.secrets attribute we look up for that vendor;
-# `default_headers` are extra HTTP headers passed to AsyncOpenAI for that
-# vendor's accounting / attribution conventions.
-OPENAI_COMPAT_PRESETS: dict[str, dict[str, str | dict[str, str] | None]] = {
-    "openrouter": {
-        "base_url": "https://openrouter.ai/api/v1",
-        "api_key_env": "OPENROUTER_API_KEY",
-        # OpenRouter recommends Referer + X-Title for attribution.
-        # Override via [llm.openrouter] referer = "..." / title = "...".
-        "default_headers_factory": "_openrouter_headers",
-    },
-    "gemini": {
-        # Google's Gemini OpenAI-compat endpoint. Speaks chat.completions,
-        # accepts tools/function calling, and tracks the same usage shape.
-        # Model ids look like "gemini-2.5-pro", "gemini-2.5-flash".
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "api_key_env": "GEMINI_API_KEY",
-        "default_headers_factory": None,
-    },
-    "google": {  # alias for gemini
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "api_key_env": "GEMINI_API_KEY",
-        "default_headers_factory": None,
-    },
-    "groq": {
-        "base_url": "https://api.groq.com/openai/v1",
-        "api_key_env": "GROQ_API_KEY",
-        "default_headers_factory": None,
-    },
-    "together": {
-        "base_url": "https://api.together.xyz/v1",
-        "api_key_env": "TOGETHER_API_KEY",
-        "default_headers_factory": None,
-    },
-    "mistral": {
-        "base_url": "https://api.mistral.ai/v1",
-        "api_key_env": "MISTRAL_API_KEY",
-        "default_headers_factory": None,
-    },
-    "ollama": {
-        "base_url": "http://localhost:11434/v1",
-        "api_key_env": "OLLAMA_API_KEY",   # usually unset; allow blank
-        "default_headers_factory": None,
-    },
-}
+class BackendUnavailable(RuntimeError):
+    """The configured backend's CLI is missing or not usable."""
 
 
-def _openrouter_headers(cfg) -> dict[str, str]:
-    """Build OpenRouter attribution headers from `[llm.openrouter]` config."""
-    h: dict[str, str] = {}
-    or_cfg = getattr(cfg.llm, "openrouter", None)
-    if or_cfg is None:
-        return h
-    referer = getattr(or_cfg, "referer", "") or ""
-    title = getattr(or_cfg, "title", "") or ""
-    if referer:
-        h["HTTP-Referer"] = referer
-    if title:
-        h["X-Title"] = title
-    return h
-
-
-def get_provider(
-    cfg,
-    *,
-    db,
-    budget,
-    retry_policy=None,
-) -> LLMProvider:
-    """Construct the LLM provider configured in `cfg.llm.provider`.
-
-    Selection is case-insensitive. Unknown values fall back to `anthropic`
-    with a warning so older configs continue to work.
-    """
+def get_provider(cfg, *, db, budget, retry_policy=None) -> LLMProvider:
+    """Construct the backend named in `cfg.llm.provider`."""
     from ..logging import get_logger
 
     log = get_logger("llm.provider")
+    name = (getattr(cfg.llm, "provider", "claude_cli") or "claude_cli").strip().lower()
 
-    name = (getattr(cfg.llm, "provider", "anthropic") or "anthropic").strip().lower()
-    if name not in KNOWN_PROVIDERS:
-        log.warning("unknown_llm_provider", configured=name, fallback="anthropic")
-        name = "anthropic"
-
-    if name == "anthropic":
-        from .anthropic_client import AnthropicClient
-
-        return AnthropicClient(cfg, db=db, budget=budget, retry_policy=retry_policy)
-
-    if name in ("openai", "openai_compatible"):
-        from .openai_client import OpenAIClient
-
-        return OpenAIClient(
-            cfg, db=db, budget=budget, retry_policy=retry_policy,
-            compat_mode=(name == "openai_compatible"),
+    if name in RETIRED_API_PROVIDERS:
+        raise BackendUnavailable(
+            f"`[llm] provider = {name!r}` selects an API-key provider, which this "
+            "project no longer supports. Use \"claude_cli\" (Claude Code) or "
+            "\"codex_cli\" (Codex) — both run on your existing subscription."
         )
 
-    # Named OpenAI-compat preset (openrouter, gemini, groq, together, ...).
-    preset = OPENAI_COMPAT_PRESETS.get(name)
-    if preset is not None:
-        from .openai_client import OpenAIClient
+    if name not in KNOWN_BACKENDS:
+        log.warning("unknown_llm_backend", configured=name, fallback="claude_cli")
+        name = "claude_cli"
 
-        # Headers come from a named factory so we can keep the table JSON-ish.
-        headers_factory = preset.get("default_headers_factory")
-        default_headers: dict[str, str] = {}
-        if headers_factory == "_openrouter_headers":
-            default_headers = _openrouter_headers(cfg)
+    if name == "codex_cli":
+        from .cli_backend.codex import CodexCliProvider
 
-        return OpenAIClient(
-            cfg,
-            db=db, budget=budget, retry_policy=retry_policy,
-            compat_mode=True,
-            preset_base_url=preset["base_url"],   # type: ignore[arg-type]
-            preset_api_key_env=preset["api_key_env"],  # type: ignore[arg-type]
-            default_headers=default_headers,
+        return CodexCliProvider(cfg, db=db, budget=budget, retry_policy=retry_policy)
+
+    from .cli_backend.claude_code import ClaudeCliProvider
+
+    return ClaudeCliProvider(cfg, db=db, budget=budget, retry_policy=retry_policy)
+
+
+# --------------------------------------------------------------------------- #
+# preflight
+
+
+@dataclass
+class BackendStatus:
+    """What `co-scientist doctor` and `init` report."""
+
+    backend: str
+    binary: str
+    binary_path: str | None
+    version: str | None
+    authenticated: bool
+    detail: str
+
+    @property
+    def ok(self) -> bool:
+        return self.binary_path is not None and self.authenticated
+
+
+def check_backend(cfg) -> BackendStatus:
+    """Verify the configured CLI exists and is signed in.
+
+    Deliberately cheap — it runs a version/status probe, never a model call,
+    so `doctor` costs nothing against the subscription.
+    """
+    import subprocess
+
+    name = (getattr(cfg.llm, "provider", "claude_cli") or "claude_cli").strip().lower()
+    if name == "codex_cli":
+        binary = cfg.llm.codex_cli.binary
+        auth_cmd = [binary, "login", "status"]
+        auth_marker = "logged in"
+    else:
+        name = "claude_cli"
+        binary = cfg.llm.claude_cli.binary
+        auth_cmd = None
+        auth_marker = ""
+
+    path = shutil.which(binary)
+    if path is None:
+        return BackendStatus(
+            backend=name, binary=binary, binary_path=None, version=None,
+            authenticated=False,
+            detail=f"{binary!r} not found on PATH — install it and sign in.",
         )
 
-    # Unreachable
-    raise ValueError(f"unsupported LLM provider {name!r}")
+    version = _probe(subprocess, [path, "--version"])
+
+    if auth_cmd is not None:
+        status_text = _probe(subprocess, [path, *auth_cmd[1:]]) or ""
+        authenticated = auth_marker in status_text.lower()
+        detail = status_text or "no auth status reported"
+    else:
+        authenticated = _claude_signed_in()
+        detail = (
+            "signed in with a Claude subscription"
+            if authenticated
+            else "not signed in — run `claude` once and complete the login."
+        )
+
+    return BackendStatus(
+        backend=name, binary=binary, binary_path=path, version=version,
+        authenticated=authenticated, detail=detail,
+    )
+
+
+def _claude_signed_in() -> bool:
+    """Detect a Claude Code subscription session without spending quota.
+
+    Claude Code has no `login status` subcommand, and where it keeps the OAuth
+    token is platform-dependent: the macOS keychain, or a credentials file
+    elsewhere. `~/.claude.json` carries an `oauthAccount` record on every
+    platform once login completes, so that is the portable signal; the file
+    check covers installs that store credentials on disk.
+    """
+    import json
+    from pathlib import Path
+
+    config = Path.home() / ".claude.json"
+    if config.exists():
+        try:
+            if json.loads(config.read_text(encoding="utf-8")).get("oauthAccount"):
+                return True
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
+    return (Path.home() / ".claude" / ".credentials.json").exists()
+
+
+def _probe(subprocess_mod, argv: list[str]) -> str | None:
+    try:
+        out = subprocess_mod.run(
+            argv, capture_output=True, text=True, timeout=20, check=False,
+        )
+    except (OSError, Exception):
+        return None
+    return (out.stdout or out.stderr or "").strip() or None
