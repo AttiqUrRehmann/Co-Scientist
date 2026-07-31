@@ -428,3 +428,55 @@ async def test_unparseable_output_is_reported_not_swallowed(
 
     with pytest.raises(CliBackendError):
         await provider.call(_spec(), _ctx())
+
+
+async def test_a_lingering_grandchild_does_not_wedge_the_call(
+    provider: ClaudeCliProvider, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression: the CLI spawns our MCP server, which inherits the stdout
+    fd. If output were captured through a pipe, `communicate()` would wait for
+    EOF — which cannot arrive while the grandchild holds that fd — and the
+    call would hang until the timeout. Observed live as a ranking task sitting
+    idle with no CLI process running.
+    """
+    import asyncio
+
+    # A fake CLI that leaves a child holding stdout open after it exits.
+    launcher = tmp_path / "fake-claude-with-orphan"
+    launcher.write_text(
+        "#!/bin/sh\n"
+        "cat >/dev/null\n"                       # consume the prompt
+        "sleep 30 &\n"                           # orphan inherits stdout
+        'printf \'{"is_error":false,"result":"done","num_turns":1}\\n\'\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+    provider._binary = str(launcher)
+    provider._backend_cfg.timeout_seconds = 25
+
+    # Must finish in about as long as the CLI itself takes, not the orphan's
+    # lifetime and not the configured timeout.
+    response = await asyncio.wait_for(provider.call(_spec(tools=[]), _ctx()), timeout=15)
+
+    assert response.raw.content[0].text == "done"
+
+
+async def test_a_hung_cli_is_killed_at_the_timeout(
+    provider: ClaudeCliProvider, tmp_path: Path
+) -> None:
+    """A wedged CLI must not hold a worker forever — bound it and move on."""
+    import asyncio
+
+    launcher = tmp_path / "fake-claude-hang"
+    launcher.write_text("#!/bin/sh\ncat >/dev/null\nsleep 60\n", encoding="utf-8")
+    launcher.chmod(0o755)
+    provider._binary = str(launcher)
+    provider._backend_cfg.timeout_seconds = 1
+    provider._retry.max_attempts = 1
+
+    # Attempts are exhausted, so the retryable timeout surfaces wrapped.
+    with pytest.raises(CliBackendError) as e:
+        await asyncio.wait_for(provider.call(_spec(tools=[]), _ctx()), timeout=20)
+
+    assert "timed out" in str(e.value)

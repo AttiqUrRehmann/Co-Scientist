@@ -15,10 +15,15 @@ Transport rules that matter:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import os
 import sys
 from collections.abc import Awaitable, Callable
 from typing import Any
+
+# How often the orphan watchdog checks whether our launcher is still alive.
+ORPHAN_CHECK_SECONDS = 5.0
 
 # Protocol revisions we know how to speak. We echo back the client's version
 # when we recognize it, else fall back to the newest we support.
@@ -66,13 +71,24 @@ class McpStdioServer:
 
     async def serve(self) -> None:
         pending: set[asyncio.Task[None]] = set()
+        watchdog = asyncio.create_task(_exit_when_orphaned())
+        try:
+            await self._read_loop(pending)
+        finally:
+            watchdog.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watchdog
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _read_loop(self, pending: set[asyncio.Task[None]]) -> None:
         while True:
             # A thread hop rather than connect_read_pipe: the latter rejects a
             # regular file, which is exactly what tests and `< input.jsonl`
             # hand us. Threads read pipes and files alike.
             line = await asyncio.to_thread(sys.stdin.buffer.readline)
             if not line:
-                break                      # client closed stdin → shut down
+                return                     # client closed stdin → shut down
             text = line.decode("utf-8", errors="replace").strip()
             if not text:
                 continue
@@ -81,8 +97,6 @@ class McpStdioServer:
             t = asyncio.create_task(self._handle_line(text))
             pending.add(t)
             t.add_done_callback(pending.discard)
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
 
     async def _handle_line(self, text: str) -> None:
         try:
@@ -168,6 +182,24 @@ class _RpcError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+async def _exit_when_orphaned() -> None:
+    """Exit if the process that launched us goes away.
+
+    We are a grandchild: the co-scientist backend spawns the agent CLI, which
+    spawns us. If the CLI dies without closing our stdin, the blocking
+    `readline` never returns and we linger — holding the inherited stdout
+    write end open and wedging whoever is reading it. Being reparented to
+    init (ppid 1) is the reliable signal that has happened.
+    """
+    original_ppid = os.getppid()
+    while True:
+        await asyncio.sleep(ORPHAN_CHECK_SECONDS)
+        current = os.getppid()
+        if current != original_ppid or current == 1:
+            log("[mcp] launcher exited; shutting down")
+            os._exit(0)          # blocked in a reader thread — cannot unwind
 
 
 def text_result(body: Any, *, is_error: bool = False) -> dict[str, Any]:

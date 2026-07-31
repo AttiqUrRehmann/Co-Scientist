@@ -300,35 +300,73 @@ class AgentCliProvider(ABC):
         )
 
     async def _spawn(self, inv: CliInvocation) -> tuple[str, str, int]:
+        """Run the CLI, capturing output through files rather than pipes.
+
+        Pipes would be the obvious choice, but they deadlock here. The CLI
+        spawns our MCP server as its own child, which inherits the stdout
+        write end. `communicate()` returns on EOF, and EOF requires *every*
+        holder of that fd to close it — so an MCP server that outlives its
+        parent by even a moment wedges the call until the timeout. Observed in
+        practice: a ranking task sat idle with no CLI process running.
+
+        Temporary files have no EOF semantics to wait on. We wait for the
+        direct child and then read whatever it wrote.
+        """
         env = sanitized_env(inv.env)
         timeout = float(self._backend_cfg.timeout_seconds)
 
         async with self._semaphore:
-            proc = await asyncio.create_subprocess_exec(
-                *inv.argv,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-                cwd=inv.cwd,
-            )
-            try:
-                out, err = await asyncio.wait_for(
-                    proc.communicate(inv.stdin.encode("utf-8")), timeout=timeout,
+            with (
+                tempfile.TemporaryFile() as out_f,
+                tempfile.TemporaryFile() as err_f,
+            ):
+                proc = await asyncio.create_subprocess_exec(
+                    *inv.argv,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=out_f,
+                    stderr=err_f,
+                    env=env,
+                    cwd=inv.cwd,
                 )
-            except TimeoutError as e:
-                proc.kill()
-                with contextlib.suppress(ProcessLookupError):
-                    await proc.wait()
-                raise CliRetryableError(
-                    f"{self.backend_name} timed out after {timeout:.0f}s"
-                ) from e
+                try:
+                    if proc.stdin is not None:
+                        proc.stdin.write(inv.stdin.encode("utf-8"))
+                        await proc.stdin.drain()
+                        proc.stdin.close()
+                    await asyncio.wait_for(proc.wait(), timeout=timeout)
+                except TimeoutError as e:
+                    await self._terminate(proc)
+                    raise CliRetryableError(
+                        f"{self.backend_name} timed out after {timeout:.0f}s"
+                    ) from e
+                except (BrokenPipeError, ConnectionResetError):
+                    # CLI exited before consuming the prompt; its own output
+                    # (below) explains why far better than this exception.
+                    await asyncio.wait_for(proc.wait(), timeout=timeout)
+
+                out_f.seek(0)
+                err_f.seek(0)
+                out = out_f.read()
+                err = err_f.read()
 
         return (
             out.decode("utf-8", errors="replace"),
             err.decode("utf-8", errors="replace"),
             proc.returncode or 0,
         )
+
+    @staticmethod
+    async def _terminate(proc: asyncio.subprocess.Process) -> None:
+        """SIGTERM, then SIGKILL if it doesn't go quietly."""
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(ProcessLookupError):
+                await proc.wait()
 
     # ----------------------------- helpers ----------------------------- #
 
