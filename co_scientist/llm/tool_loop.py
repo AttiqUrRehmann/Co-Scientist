@@ -277,14 +277,16 @@ def _content_to_dicts(content) -> list[dict[str, Any]]:
         if t == "text":
             out.append({"type": "text", "text": getattr(b, "text", "")})
         elif t == "tool_use":
-            out.append(
-                {
-                    "type": "tool_use",
-                    "id": getattr(b, "id", ""),
-                    "name": getattr(b, "name", ""),
-                    "input": getattr(b, "input", {}),
-                }
-            )
+            d = {
+                "type": "tool_use",
+                "id": getattr(b, "id", ""),
+                "name": getattr(b, "name", ""),
+                "input": getattr(b, "input", {}),
+            }
+            provider_fields = getattr(b, "provider_fields", None)
+            if isinstance(provider_fields, dict) and provider_fields:
+                d["provider_fields"] = provider_fields
+            out.append(d)
         elif t == "thinking":
             d: dict[str, Any] = {"type": "thinking", "thinking": getattr(b, "thinking", "")}
             sig = getattr(b, "signature", None)

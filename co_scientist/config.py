@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -209,6 +209,21 @@ class OpenRouterProviderCfg(BaseModel):
     title: str = ""
 
 
+ThinkingLevel = Literal["default", "minimal", "low", "medium", "high"]
+
+
+class GeminiProviderCfg(BaseModel):
+    """Gemini reasoning controls for the OpenAI-compatible endpoint.
+
+    ``default`` omits ``reasoning_effort`` and lets the selected Gemini model
+    use its own default. Per-mode overrides use routing keys such as
+    ``generation.literature`` or ``metareview.final``.
+    """
+
+    thinking_level: ThinkingLevel = "default"
+    thinking_by_mode: dict[str, ThinkingLevel] = Field(default_factory=dict)
+
+
 class LLMCfg(BaseModel):
     """Choose which LLM vendor backs the agents.
 
@@ -223,8 +238,9 @@ class LLMCfg(BaseModel):
       major vendor in one place. Set OPENROUTER_API_KEY (or
       OPENAI_API_KEY). Optional attribution in [llm.openrouter].
     - "gemini" / "google" — Google Gemini via the official OpenAI-compat
-      endpoint. Set GEMINI_API_KEY. Models: "gemini-2.5-pro",
-      "gemini-2.5-flash", etc.
+      endpoint. Set GEMINI_API_KEY. Thought signatures are preserved
+      automatically. Optional semantic reasoning levels are configured under
+      `llm.gemini`.
     - "groq", "together", "mistral", "ollama" — convenience presets for
       those endpoints; each reads its own API key env var
       (GROQ_API_KEY, TOGETHER_API_KEY, MISTRAL_API_KEY).
@@ -237,6 +253,7 @@ class LLMCfg(BaseModel):
     openai: OpenAIProviderCfg = Field(default_factory=OpenAIProviderCfg)
     anthropic: AnthropicProviderCfg = Field(default_factory=AnthropicProviderCfg)
     openrouter: OpenRouterProviderCfg = Field(default_factory=OpenRouterProviderCfg)
+    gemini: GeminiProviderCfg = Field(default_factory=GeminiProviderCfg)
 
 
 class WebUICfg(BaseModel):

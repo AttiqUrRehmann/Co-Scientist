@@ -154,8 +154,8 @@ classifier_warn_categories = ["dual_use_bio"]
 #                  "anthropic/claude-3.5-sonnet", "openai/gpt-5",
 #                  "google/gemini-2.5-pro", "meta-llama/llama-3.3-70b".
 #   "gemini"     — Google Gemini via OpenAI-compat endpoint. Set
-#                  GEMINI_API_KEY. Models: "gemini-2.5-pro",
-#                  "gemini-2.5-flash", "gemini-1.5-pro".
+#                  GEMINI_API_KEY. Models: "gemini-3.5-flash-lite",
+#                  "gemini-3.5-flash", "gemini-2.5-pro".
 #   "groq"       — Groq (fast Llama / Mixtral). Set GROQ_API_KEY.
 #   "together"   — Together AI. Set TOGETHER_API_KEY.
 #   "mistral"    — Mistral la-plateforme. Set MISTRAL_API_KEY.
@@ -172,6 +172,26 @@ provider = "anthropic"
 # overrides the preset's base_url (rarely needed).
 [llm.openai]
 # base_url = ""
+
+# Gemini reasoning control for provider = "gemini" / "google".
+# "default" omits reasoning_effort and uses the selected model's default.
+# For multi-step agent/tool work, "medium" is a sensible starting point.
+[llm.gemini]
+thinking_level = "default"  # default | minimal | low | medium | high
+
+# Optional per-mode overrides. Keys match agent routing modes.
+# [llm.gemini.thinking_by_mode]
+# "parse_goal" = "minimal"
+# "generation.literature" = "medium"
+# "reflection.full" = "high"
+# "ranking.pairwise" = "medium"
+# "ranking.debate" = "high"
+# "evolution.combine" = "high"
+# "evolution.out_of_box" = "high"
+# "evolution.feasibility" = "medium"
+# "evolution.simplify" = "medium"
+# "metareview.system" = "medium"
+# "metareview.final" = "high"
 
 # OpenRouter attribution (optional; for catalog ranking).
 [llm.openrouter]

@@ -161,7 +161,7 @@ Providers are listed alphabetically — none is preferred; pick whichever you ha
 | provider              | Endpoint                                                | API-key env var         | Example models                                            |
 | --------------------- | ------------------------------------------------------- | ----------------------- | --------------------------------------------------------- |
 | `anthropic`           | api.anthropic.com                                       | `ANTHROPIC_API_KEY`     | `claude-opus-4-7`, `claude-sonnet-4-6`                    |
-| `gemini` / `google`   | generativelanguage.googleapis.com (OpenAI-compat)       | `GEMINI_API_KEY`        | `gemini-2.5-pro`, `gemini-2.5-flash`                      |
+| `gemini` / `google`   | generativelanguage.googleapis.com (OpenAI-compat)       | `GEMINI_API_KEY`        | `gemini-3.5-flash-lite`, `gemini-3.5-flash`, `gemini-2.5-pro` |
 | `groq`                | api.groq.com                                            | `GROQ_API_KEY`          | `llama-3.3-70b-versatile`, `mixtral-8x7b-32768`           |
 | `mistral`             | api.mistral.ai                                          | `MISTRAL_API_KEY`       | `mistral-large-latest`, `codestral-latest`                |
 | `ollama`              | localhost:11434 — local models                          | *(none)*                | `llama3.3:70b`, `qwen2.5:32b`                             |
@@ -171,6 +171,39 @@ Providers are listed alphabetically — none is preferred; pick whichever you ha
 | `together`            | api.together.xyz                                        | `TOGETHER_API_KEY`      | `meta-llama/Llama-3.3-70B-Instruct-Turbo`                 |
 
 > Key precedence: for every OpenAI-compatible preset (`openrouter`, `gemini`, `groq`, `together`, `mistral`, `ollama`), `OPENAI_API_KEY` is used **first** if it's set, and the provider-specific var above is only the fallback. So if you have a stray `OPENAI_API_KEY` in your environment it will be sent to the preset's endpoint (and rejected) — unset it, or set only the provider's own key, when using a preset.
+
+### Gemini thinking and tool calls
+
+Gemini 3 models attach an opaque thought signature to function calls. The
+OpenAI-compatible adapter preserves provider-owned tool-call metadata, but
+only the named `gemini` / `google` providers replay Gemini's documented
+`extra_content` envelope with the corresponding function result. Other
+response-only tool-call fields are retained for diagnostics and future
+provider adapters, but are not sent to endpoints that may reject them. No
+manual signature configuration is required.
+
+Gemini's thinking level is also optional. With `thinking_level = "default"`
+the request omits `reasoning_effort` and Gemini uses the selected model's
+default. For this system's autonomous, multi-step literature and evaluation
+work, `medium` is a sensible starting point:
+
+```toml
+[llm]
+provider = "gemini"
+
+[llm.gemini]
+thinking_level = "medium"  # default | minimal | low | medium | high
+
+[llm.gemini.thinking_by_mode]
+"parse_goal" = "minimal"
+"reflection.verification" = "high"
+"metareview.final" = "high"
+```
+
+Per-mode entries override the global level and use the same `agent.mode` names
+as model routing. These semantic levels are separate from the numeric
+Anthropic `[thinking]` token budgets. Do not fabricate or edit thought
+signatures; the adapter treats them as provider-owned continuation state.
 
 Mixing vendors per session requires picking the provider once; for multi-vendor routing in a single session, use `provider = "openrouter"` and let OpenRouter dispatch upstream per model:
 
@@ -197,11 +230,11 @@ Cost is estimated via `co_scientist/llm/routing.py`'s `PRICE_TABLE`; unknown mod
 | Feature                     | `anthropic` | everything else (OpenAI + all OpenAI-compatible providers) |
 | --------------------------- | ----------- | ---------------------------------------------------------- |
 | Tool / function call *(required)* | ✅    | ✅ native OpenAI; on other endpoints it must be supported or the run fails |
-| Extended reasoning          | ✅ via `thinking` budgets | ✅ via `reasoning_effort`, **only for reasoning models** — the model id must start with `o1`/`o3`/`o4` or contain `reasoning`; for any other model (e.g. `gpt-4o`) the thinking budget is dropped |
+| Extended reasoning          | ✅ via numeric `[thinking]` budgets | ✅ OpenAI reasoning models use `reasoning_effort`; Gemini uses optional `[llm.gemini]` semantic levels |
 | Prompt-cache breakpoints    | ✅          | ❌ (stripped before sending)                               |
 | Batch API (50%-off ranking) | ✅          | ❌ (Anthropic-only; other providers run all matches synchronously) |
 
-> Note: the reasoning-model check is a name heuristic ([`openai_client.py`](co_scientist/llm/openai_client.py) `_is_reasoning_model`). Newer reasoning-capable models whose ids don't match the pattern (e.g. `gpt-5`) won't get `reasoning_effort` until the heuristic is updated — they still work, just without an explicit reasoning budget.
+> For direct OpenAI and generic OpenAI-compatible endpoints, the reasoning-model check is a name heuristic ([`openai_client.py`](co_scientist/llm/openai_client.py) `_is_reasoning_model`). Model ids that do not match it still work, but do not receive a numeric `[thinking]` budget translated to `reasoning_effort`. The named Gemini provider uses its explicit semantic configuration instead.
 
 ## Configuration
 
