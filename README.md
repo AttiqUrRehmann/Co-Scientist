@@ -2,7 +2,7 @@
 
 An open source re-implementation of Google's **AI co-scientist** ([Gottweis et al., *Nature*, 2026](https://www.nature.com/articles/s41586-026-10644-y); [research blog, 2025](https://research.google/blog/accelerating-scientific-breakthroughs-with-an-ai-co-scientist/)) — a multi-agent system that takes a natural-language research goal and produces a tournament-ranked **research overview** of novel hypotheses.
 
-**It runs on an LLM API key or on your Claude Code / Codex subscription.** Point `[llm] provider` at a metered API (Anthropic, OpenAI, OpenRouter, Gemini, …), or at a local `claude -p` / `codex exec` CLI that authenticates with its own OAuth login and bills nothing per token. Under the CLI backends, structured output and citation provenance come back through a bundled MCP server. Either way the agents are identical — see [LLM backend](#llm-backend).
+**It runs on an LLM API key or on your Claude Code / Codex subscription.** The default routes everything through **OpenRouter**, so one key reaches 200+ models from every vendor and `[models]` can mix them per agent. You can also point `[llm] provider` at Anthropic, OpenAI, or Gemini directly, or at a local `claude -p` / `codex exec` CLI that authenticates with its own OAuth login and bills nothing per token. Under the CLI backends, structured output and citation provenance come back through a bundled MCP server. Either way the agents are identical — see [LLM backend](#llm-backend).
 
 The agent roster, prompts, and control flow follow the paper. Source materials that were used to instruct the coding agent (mainly Claude Code) include:
 
@@ -109,11 +109,16 @@ Then pick one of the two backend families. Either an **API key** for the
 provider you want:
 
 ```bash
-# whichever one matches [llm] provider
-export ANTHROPIC_API_KEY=...       # provider = "anthropic" (the default)
+export OPENROUTER_API_KEY=...      # provider = "openrouter" (the default)
+# or, to talk to one vendor directly:
+export ANTHROPIC_API_KEY=...       # provider = "anthropic"
 export OPENAI_API_KEY=...          # provider = "openai"
 export GEMINI_API_KEY=...          # provider = "gemini"
 ```
+
+> A stray `OPENAI_API_KEY` in your environment takes precedence over every
+> OpenAI-compatible preset's own key, `OPENROUTER_API_KEY` included — it gets
+> sent to OpenRouter and rejected. Unset it, or set only the preset's key.
 
 …or a **subscription CLI** installed and signed in, with no key at all:
 
@@ -163,7 +168,7 @@ Two families of backend serve the same agents, selected with `[llm] provider`:
 
 | Family | `provider` values | Billing | Needs |
 | --- | --- | --- | --- |
-| **Metered API** | `anthropic` *(default)*, `openai`, `openrouter`, `gemini`/`google`, `groq`, `together`, `mistral`, `ollama`, `openai_compatible` | per token | an API key |
+| **Metered API** | `openrouter` *(default)*, `anthropic`, `openai`, `gemini`/`google`, `groq`, `together`, `mistral`, `ollama`, `openai_compatible` | per token | an API key |
 | **Subscription CLI** | `claude_cli`, `codex_cli` | included in a subscription you already pay for | the CLI installed and signed in |
 
 They are fully interchangeable from the agents' point of view — the same six
@@ -173,14 +178,14 @@ by whichever family you pick, so switching usually means revisiting it.
 
 ### Metered API providers
 
-Every agent talks to one provider per session. Any of the providers below works; pick whichever you have a key for.
+Every agent talks to one provider per session. `openrouter` is the default because one key reaches every vendor's catalog, which is also the only way to give different agents different vendors in a single session. Any of the providers below works; pick whichever you have a key for.
 
-Config is **deep-merged** over [`config/default.toml`](config/default.toml), whose `[models]` defaults are Claude model ids. So if you switch `provider` away from `anthropic`, override **every** key in `[models]` — any key you leave out keeps its Claude default and will be sent to your new provider, which will reject it. Fill in model ids your chosen provider exposes (see the provider table below for examples per vendor):
+Config is **deep-merged** over [`config/default.toml`](config/default.toml), whose `[models]` defaults are OpenRouter ids (`anthropic/claude-opus-4-7` and friends). So if you switch `provider` away from `openrouter`, override **every** key in `[models]` — any key you leave out keeps its OpenRouter default and will be sent to your new provider, which will reject it. `co-scientist doctor` and every `run` warn about ids that look like they belong to another provider, so you find out in preflight rather than at the first model call. Fill in model ids your chosen provider exposes (see the provider table below for examples per vendor):
 
 ```toml
 [llm]
 # Pick one. See the provider table below.
-provider = "openai"   # anthropic | openai | openrouter | gemini | google | groq | together | mistral | ollama | openai_compatible
+provider = "openai"   # openrouter | anthropic | openai | gemini | google | groq | together | mistral | ollama | openai_compatible
 
 [models]
 # Override ALL of these with model ids from your chosen provider.
@@ -199,7 +204,7 @@ classifier          = "<cheap-model>"
 judge               = "<cheap-model>"
 ```
 
-Providers are listed alphabetically — none is preferred; pick whichever you have a key for.
+Providers are listed alphabetically. `openrouter` is the default, but nothing else about the system prefers it; pick whichever you have a key for.
 
 | provider              | Endpoint                                                | API-key env var         | Example models                                            |
 | --------------------- | ------------------------------------------------------- | ----------------------- | --------------------------------------------------------- |
@@ -210,7 +215,7 @@ Providers are listed alphabetically — none is preferred; pick whichever you ha
 | `ollama`              | localhost:11434 — local models                          | *(none)*                | `llama3.3:70b`, `qwen2.5:32b`                             |
 | `openai`              | api.openai.com                                          | `OPENAI_API_KEY`        | `gpt-5`, `gpt-4o`, `o3-mini`                              |
 | `openai_compatible`   | Anything else; set `[llm.openai] base_url` explicitly   | `OPENAI_API_KEY`        | depends                                                   |
-| `openrouter`          | openrouter.ai — 200+ models from every major vendor     | `OPENROUTER_API_KEY`    | `openai/gpt-5`, `google/gemini-2.5-pro`, `anthropic/claude-3.5-sonnet`, `meta-llama/llama-3.3-70b-instruct` |
+| `openrouter` *(default)* | openrouter.ai — 200+ models from every major vendor  | `OPENROUTER_API_KEY`    | `openai/gpt-5`, `google/gemini-2.5-pro`, `anthropic/claude-3.5-sonnet`, `meta-llama/llama-3.3-70b-instruct` |
 | `together`            | api.together.xyz                                        | `TOGETHER_API_KEY`      | `meta-llama/Llama-3.3-70B-Instruct-Turbo`                 |
 
 > Key precedence: for every OpenAI-compatible preset (`openrouter`, `gemini`, `groq`, `together`, `mistral`, `ollama`), `OPENAI_API_KEY` is used **first** if it's set, and the provider-specific var above is only the fallback. So if you have a stray `OPENAI_API_KEY` in your environment it will be sent to the preset's endpoint (and rejected) — unset it, or set only the provider's own key, when using a preset.
@@ -248,7 +253,7 @@ as model routing. These semantic levels are separate from the numeric
 Anthropic `[thinking]` token budgets. Do not fabricate or edit thought
 signatures; the adapter treats them as provider-owned continuation state.
 
-Mixing vendors per session requires picking the provider once; for multi-vendor routing in a single session, use `provider = "openrouter"` and let OpenRouter dispatch upstream per model:
+Every other provider talks to exactly one vendor. For multi-vendor routing inside a single session, stay on the default `provider = "openrouter"` and let it dispatch upstream per model:
 
 ```toml
 [llm]

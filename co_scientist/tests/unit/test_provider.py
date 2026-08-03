@@ -50,8 +50,37 @@ def test_known_providers_includes_presets() -> None:
     assert "ollama" in KNOWN_PROVIDERS
 
 
-def test_get_provider_returns_anthropic_by_default() -> None:
+def test_get_provider_returns_openrouter_by_default() -> None:
     cfg = Config()
+    cfg.secrets.OPENROUTER_API_KEY = "sk-or-fake"
+    with patch("openai.AsyncOpenAI"):
+        p = get_provider(cfg, db=MagicMock(), budget=MagicMock())
+    # OpenRouter speaks chat.completions, so it rides the OpenAI client.
+    assert type(p).__name__ == "OpenAIClient"
+    assert p._provider_name == "openrouter"
+
+
+def test_the_default_models_belong_to_the_default_provider() -> None:
+    """`[models]` is family-specific, so a mismatched default breaks every run.
+
+    Config is deep-merged, so any default left behind gets sent verbatim to
+    whatever endpoint is configured. Pricing is the observable proxy: an id from
+    the wrong family misses PRICE_TABLE and falls back to a family
+    hint, which is exactly the silent drift this guards.
+    """
+    from co_scientist.config import DEFAULT_PROVIDER
+    from co_scientist.llm.routing import PRICE_TABLE
+
+    cfg = Config()
+    assert cfg.llm.provider == DEFAULT_PROVIDER == "openrouter"
+    for field, model in vars(cfg.models).items():
+        assert "/" in model, f"models.{field} = {model!r} is not an OpenRouter id"
+        assert model in PRICE_TABLE, f"models.{field} = {model!r} is unpriced"
+
+
+def test_get_provider_returns_anthropic_when_configured() -> None:
+    cfg = Config()
+    cfg.llm.provider = "anthropic"
     cfg.secrets.ANTHROPIC_API_KEY = "sk-fake"
     with patch("co_scientist.llm.anthropic_client.AsyncAnthropic"):
         p = get_provider(cfg, db=MagicMock(), budget=MagicMock())
@@ -66,15 +95,17 @@ def test_get_provider_returns_openai_when_configured() -> None:
     with patch("openai.AsyncOpenAI"):
         p = get_provider(cfg, db=MagicMock(), budget=MagicMock())
     assert type(p).__name__ == "OpenAIClient"
+    assert p._provider_name == "openai"
 
 
-def test_get_provider_unknown_falls_back_to_anthropic() -> None:
+def test_get_provider_unknown_falls_back_to_the_default() -> None:
     cfg = Config()
     cfg.llm.provider = "totally-made-up"
-    cfg.secrets.ANTHROPIC_API_KEY = "sk-fake"
-    with patch("co_scientist.llm.anthropic_client.AsyncAnthropic"):
+    cfg.secrets.OPENROUTER_API_KEY = "sk-or-fake"
+    with patch("openai.AsyncOpenAI"):
         p = get_provider(cfg, db=MagicMock(), budget=MagicMock())
-    assert type(p).__name__ == "AnthropicClient"
+    assert type(p).__name__ == "OpenAIClient"
+    assert p._provider_name == "openrouter"
 
 
 def test_compat_mode_sets_base_url() -> None:

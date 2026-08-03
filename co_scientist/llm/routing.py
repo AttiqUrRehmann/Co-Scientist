@@ -146,9 +146,11 @@ DEGRADE_CHAINS: tuple[list[str], ...] = (
     ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
     ["opus", "sonnet", "haiku"],
     [
+        # OpenRouter spells the Haiku tier with a dot; using the dashed form
+        # here would degrade onto an id that misses OPENROUTER_PRICE_TABLE.
         "anthropic/claude-opus-4-7",
         "anthropic/claude-sonnet-4-6",
-        "anthropic/claude-haiku-4-5",
+        "anthropic/claude-haiku-4.5",
     ],
 )
 

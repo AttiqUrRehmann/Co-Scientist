@@ -46,6 +46,7 @@ import shutil
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
+from ..config import DEFAULT_PROVIDER
 from .types import AgentCallSpec, CallContext, LLMResponse
 
 
@@ -167,10 +168,10 @@ def get_provider(
 
     log = get_logger("llm.provider")
 
-    name = (getattr(cfg.llm, "provider", "anthropic") or "anthropic").strip().lower()
+    name = (getattr(cfg.llm, "provider", DEFAULT_PROVIDER) or DEFAULT_PROVIDER).strip().lower()
     if name not in KNOWN_PROVIDERS:
-        log.warning("unknown_llm_provider", configured=name, fallback="anthropic")
-        name = "anthropic"
+        log.warning("unknown_llm_provider", configured=name, fallback=DEFAULT_PROVIDER)
+        name = DEFAULT_PROVIDER
 
     # Subscription CLI backends. Imported lazily so an API-only install never
     # pays for the subprocess machinery, and vice versa.
@@ -251,9 +252,9 @@ def check_backend(cfg) -> BackendStatus:
     subscription. For an API provider it checks that a key is resolvable — the
     only preflight possible without spending money.
     """
-    name = (getattr(cfg.llm, "provider", "anthropic") or "anthropic").strip().lower()
+    name = (getattr(cfg.llm, "provider", DEFAULT_PROVIDER) or DEFAULT_PROVIDER).strip().lower()
     if name not in KNOWN_PROVIDERS:
-        name = "anthropic"
+        name = DEFAULT_PROVIDER
     if name in API_PROVIDERS:
         return _check_api_provider(cfg, name)
     return _check_cli_backend(cfg, name)
@@ -323,6 +324,62 @@ def _check_cli_backend(cfg, name: str) -> BackendStatus:
         backend=name, binary=binary, binary_path=path, version=version,
         authenticated=authenticated, detail=detail,
     )
+
+
+# Whether a backend's model ids are vendor-prefixed ("anthropic/claude-opus-4-7"
+# vs "claude-opus-4-7"). `None` means the backend has no convention we can check
+# — `openai_compatible` points wherever `[llm.openai] base_url` says.
+#
+# This is the one cross-cutting misconfiguration the layered config invites:
+# `[models]` is deep-merged, so switching `[llm] provider` without replacing
+# every key leaves ids from the previous family in place. Nothing notices until
+# the first real model call, which 404s after a session has already started.
+_EXPECTS_VENDOR_PREFIX: dict[str, bool | None] = {
+    "openrouter": True,
+    "together": True,           # e.g. "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+    "openai_compatible": None,
+    "anthropic": False,
+    "openai": False,
+    "gemini": False,
+    "google": False,
+    "groq": False,
+    "mistral": False,
+    "ollama": False,
+    "claude_cli": False,
+    "codex_cli": False,
+}
+
+
+def check_models(cfg) -> list[str]:
+    """Flag `[models]` entries that look like another provider's ids.
+
+    Returns one message per offending entry, empty when everything matches (or
+    when the backend has no naming convention to check against). A heuristic, so
+    callers should warn rather than refuse to run.
+    """
+    name = (getattr(cfg.llm, "provider", DEFAULT_PROVIDER) or DEFAULT_PROVIDER).strip().lower()
+    if name not in KNOWN_PROVIDERS:
+        name = DEFAULT_PROVIDER
+    expects_prefix = _EXPECTS_VENDOR_PREFIX.get(name)
+    if expects_prefix is None:
+        return []
+
+    problems: list[str] = []
+    for field, model in vars(cfg.models).items():
+        if not isinstance(model, str) or not model:
+            continue
+        has_prefix = "/" in model
+        if has_prefix and not expects_prefix:
+            problems.append(
+                f"models.{field} = {model!r} is vendor-prefixed, which "
+                f"{name!r} does not accept — drop the prefix"
+            )
+        elif not has_prefix and expects_prefix:
+            problems.append(
+                f"models.{field} = {model!r} has no vendor prefix, which "
+                f"{name!r} requires — e.g. 'anthropic/{model}'"
+            )
+    return problems
 
 
 def _claude_signed_in() -> bool:

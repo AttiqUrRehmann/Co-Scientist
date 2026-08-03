@@ -76,3 +76,56 @@ def test_anthropic_provider_does_not_accept_openai_key() -> None:
     cfg = _cfg("anthropic")
     cfg.secrets.OPENAI_API_KEY = "sk-fake"
     assert not has_llm_key(cfg)
+
+
+# ---------------------- models vs provider family ---------------------- #
+
+
+def test_default_models_match_the_default_provider() -> None:
+    from co_scientist.llm.provider import check_models
+
+    assert check_models(Config()) == []
+
+
+def test_openrouter_ids_are_flagged_under_a_single_vendor_provider() -> None:
+    """The layered-config trap: `[models]` is deep-merged, so switching provider
+    without replacing every key leaves the previous family's ids in place. A
+    live `claude -p --model anthropic/claude-opus-4-7` 404s, but only once the
+    session is already running."""
+    from co_scientist.llm.provider import check_models
+
+    cfg = Config()
+    cfg.llm.provider = "claude_cli"
+    problems = check_models(cfg)
+    assert len(problems) == len(vars(cfg.models))
+    assert "vendor-prefixed" in problems[0]
+    assert "claude_cli" in problems[0]
+
+
+def test_bare_ids_are_flagged_under_openrouter() -> None:
+    from co_scientist.llm.provider import check_models
+
+    cfg = Config()
+    cfg.models.generation = "claude-opus-4-7"
+    problems = check_models(cfg)
+    assert len(problems) == 1
+    assert "no vendor prefix" in problems[0]
+
+
+def test_together_expects_a_prefix_too() -> None:
+    """Together's ids look like 'meta-llama/Llama-3.3-70B-Instruct-Turbo'."""
+    from co_scientist.llm.provider import check_models
+
+    cfg = Config()
+    cfg.llm.provider = "together"
+    assert check_models(cfg) == []
+
+
+def test_openai_compatible_has_no_convention_to_check() -> None:
+    """It points at whatever `[llm.openai] base_url` says, so stay quiet."""
+    from co_scientist.llm.provider import check_models
+
+    cfg = Config()
+    cfg.llm.provider = "openai_compatible"
+    cfg.models.generation = "some-local-gguf"
+    assert check_models(cfg) == []

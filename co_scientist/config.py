@@ -17,6 +17,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = PROJECT_ROOT / "config" / "default.toml"
 
+# The backend used when `[llm] provider` is absent, blank, or unrecognized.
+# Single-sourced because `ModelsCfg`'s defaults only make sense for one family:
+# if this and those ever disagree, the out-of-the-box config sends model ids to
+# an endpoint that rejects them.
+DEFAULT_PROVIDER = "openrouter"
+
 
 class RunCfg(BaseModel):
     concurrency: int = 4
@@ -107,28 +113,35 @@ class BudgetSharesCfg(BaseModel):
 class ModelsCfg(BaseModel):
     """Per-agent model selection, interpreted by the configured backend.
 
-    Values go verbatim to the vendor SDK, or to the CLI's `--model` flag. The
-    defaults are full Anthropic ids because those work under both `anthropic`
-    and `claude_cli` (Claude Code's `--model` accepts a full id as readily as an
-    alias like "opus"), and because `routing.py` prices and gates thinking
-    budgets off the model name — an alias matches neither.
+    Values go verbatim to the vendor SDK, or to the CLI's `--model` flag, so
+    they must match the family in `[llm] provider`. The defaults are OpenRouter
+    ids to match the default provider; every one is in
+    `routing.OPENROUTER_PRICE_TABLE`, so cost estimates and the degrade chain
+    both resolve.
 
-    Switching to another family means replacing these: OpenRouter wants
-    "anthropic/claude-opus-4-7", Gemini wants "gemini-3-pro", Codex wants a
-    Codex model id.
+    Two tiers is the whole design — a stronger model for the reasoning-heavy
+    agents and a cheaper one for the rest. Switching families means replacing
+    all of these: `anthropic` wants "claude-opus-4-7", `gemini` wants
+    "gemini-3-pro", `claude_cli` takes either that or an alias like "opus",
+    `codex_cli` wants a Codex model id.
+
+    Because config is deep-merged, a key left behind after such a switch keeps
+    its default and gets sent verbatim to the new endpoint. `provider.check_models`
+    flags that in preflight — otherwise nothing notices until the first model
+    call 404s, with a session already running.
     """
 
-    parse_goal: str = "claude-sonnet-4-6"
-    generation: str = "claude-opus-4-7"
-    reflection: str = "claude-opus-4-7"
-    evolution: str = "claude-opus-4-7"
-    ranking_pairwise: str = "claude-sonnet-4-6"
-    ranking_debate: str = "claude-sonnet-4-6"
-    ranking_priority: str = "claude-opus-4-7"
-    metareview_feedback: str = "claude-sonnet-4-6"
-    metareview_final: str = "claude-opus-4-7"
-    classifier: str = "claude-haiku-4-5-20251001"
-    judge: str = "claude-sonnet-4-6"
+    parse_goal: str = "anthropic/claude-sonnet-4-6"
+    generation: str = "anthropic/claude-opus-4-7"
+    reflection: str = "anthropic/claude-opus-4-7"
+    evolution: str = "anthropic/claude-opus-4-7"
+    ranking_pairwise: str = "anthropic/claude-sonnet-4-6"
+    ranking_debate: str = "anthropic/claude-sonnet-4-6"
+    ranking_priority: str = "anthropic/claude-opus-4-7"
+    metareview_feedback: str = "anthropic/claude-sonnet-4-6"
+    metareview_final: str = "anthropic/claude-opus-4-7"
+    classifier: str = "anthropic/claude-haiku-4.5"
+    judge: str = "anthropic/claude-sonnet-4-6"
 
 
 class ThinkingCfg(BaseModel):
@@ -290,15 +303,16 @@ class LLMCfg(BaseModel):
 
     **Metered API** — a vendor SDK with a per-token bill.
 
-    - "anthropic" — Claude via the official Anthropic SDK (default). Cache
-      breakpoints, extended thinking, and the Batch API are only available
-      under this provider.
+    - "openrouter" — OpenRouter (openrouter.ai), the default. 200+ models from
+      every major vendor behind one key, which is what makes per-agent
+      multi-vendor routing possible in a single session. Set OPENROUTER_API_KEY
+      (or OPENAI_API_KEY). Optional attribution in [llm.openrouter].
+    - "anthropic" — Claude via the official Anthropic SDK. Cache breakpoints,
+      extended thinking, and the Batch API are only available under this
+      provider.
     - "openai" — OpenAI Chat Completions. Extended reasoning is translated
       to `reasoning_effort` for the o-series models; cache breakpoints are
       stripped.
-    - "openrouter" — OpenRouter (openrouter.ai). 200+ models from every
-      major vendor in one place. Set OPENROUTER_API_KEY (or
-      OPENAI_API_KEY). Optional attribution in [llm.openrouter].
     - "gemini" / "google" — Google Gemini via the official OpenAI-compat
       endpoint. Set GEMINI_API_KEY. Thought signatures are preserved
       automatically. Optional semantic reasoning levels are configured under
@@ -314,7 +328,7 @@ class LLMCfg(BaseModel):
     switching families generally means revisiting it.
     """
 
-    provider: str = "anthropic"
+    provider: str = DEFAULT_PROVIDER
     openai: OpenAIProviderCfg = Field(default_factory=OpenAIProviderCfg)
     anthropic: AnthropicProviderCfg = Field(default_factory=AnthropicProviderCfg)
     openrouter: OpenRouterProviderCfg = Field(default_factory=OpenRouterProviderCfg)
@@ -434,7 +448,7 @@ def load_config(extra_path: Path | None = None) -> Config:
 
 def backend_binary(cfg: Config) -> str:
     """Name of the agent CLI the configured backend drives, or '' for an API."""
-    name = (getattr(cfg.llm, "provider", "anthropic") or "anthropic").strip().lower()
+    name = (getattr(cfg.llm, "provider", DEFAULT_PROVIDER) or DEFAULT_PROVIDER).strip().lower()
     if name == "codex_cli":
         return cfg.llm.codex_cli.binary
     if name == "claude_cli":
@@ -463,8 +477,8 @@ _PROVIDER_ENV_VARS: dict[str, str] = {
 
 def provider_key_env(cfg: Config) -> str:
     """Env-var name the configured LLM provider expects, or '' if keyless."""
-    name = (getattr(cfg.llm, "provider", "anthropic") or "anthropic").strip().lower()
-    return _PROVIDER_ENV_VARS.get(name, "ANTHROPIC_API_KEY")
+    name = (getattr(cfg.llm, "provider", DEFAULT_PROVIDER) or DEFAULT_PROVIDER).strip().lower()
+    return _PROVIDER_ENV_VARS.get(name, _PROVIDER_ENV_VARS[DEFAULT_PROVIDER])
 
 
 def has_llm_key(cfg: Config) -> bool:

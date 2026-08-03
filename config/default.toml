@@ -80,21 +80,39 @@ metareview = 0.10
 proximity  = 0.02
 reserve    = 0.08
 
-# Passed verbatim to the backend's --model flag: CLI aliases under
-# claude_cli ("opus" / "sonnet" / "haiku"), Codex model ids under codex_cli.
+# Passed verbatim to the configured backend, so these must match the family in
+# [llm]. Below are OpenRouter ids for the default provider. Two tiers is the
+# whole design: a stronger model for the reasoning-heavy agents, a cheaper one
+# for the rest. Any agent can point at any vendor — OpenRouter dispatches
+# upstream — so mixing "openai/gpt-5" and "google/gemini-3-pro" in here works.
+#
+# Switching family means replacing ALL of these. Config is deep-merged, so a key
+# you leave out keeps its OpenRouter default and gets sent to the new endpoint,
+# which will reject it. Equivalents:
+#   anthropic    "claude-opus-4-7" / "claude-sonnet-4-6" / "claude-haiku-4-5-20251001"
+#   gemini       "gemini-3-pro" / "gemini-3-flash"
+#   claude_cli   either the anthropic ids above, or "opus" / "sonnet" / "haiku"
+#   codex_cli    Codex model ids your ChatGPT account is entitled to
 [models]
-parse_goal          = "claude-sonnet-4-6"
-generation          = "claude-opus-4-7"
-reflection          = "claude-opus-4-7"
-evolution           = "claude-opus-4-7"
-ranking_pairwise    = "claude-sonnet-4-6"
-ranking_debate      = "claude-sonnet-4-6"
-ranking_priority    = "claude-opus-4-7"
-metareview_feedback = "claude-sonnet-4-6"
-metareview_final    = "claude-opus-4-7"
-classifier          = "claude-haiku-4-5-20251001"
-judge               = "claude-sonnet-4-6"
+parse_goal          = "anthropic/claude-sonnet-4-6"
+generation          = "anthropic/claude-opus-4-7"
+reflection          = "anthropic/claude-opus-4-7"
+evolution           = "anthropic/claude-opus-4-7"
+ranking_pairwise    = "anthropic/claude-sonnet-4-6"
+ranking_debate      = "anthropic/claude-sonnet-4-6"
+ranking_priority    = "anthropic/claude-opus-4-7"
+metareview_feedback = "anthropic/claude-sonnet-4-6"
+metareview_final    = "anthropic/claude-opus-4-7"
+classifier          = "anthropic/claude-haiku-4.5"
+judge               = "anthropic/claude-sonnet-4-6"
 
+# Extended-reasoning budgets, in tokens. Only `provider = "anthropic"` sends
+# these as a real thinking budget. Under the default OpenRouter provider they
+# are dropped before the request: routing zeroes them for any model without
+# "opus" in its name, and the OpenAI-compatible adapter only translates a budget
+# into `reasoning_effort` for o-series ids. They are kept at these values so
+# switching to `anthropic` needs no other edit. `gemini` has its own semantic
+# levels under [llm.gemini]; `claude_cli` maps these onto --effort tiers.
 [thinking]
 # Per agent.mode reasoning budgets; 0 = disabled. The CLIs take discrete
 # effort tiers rather than token budgets, so these map onto
@@ -179,12 +197,14 @@ classifier_warn_categories = ["dual_use_bio"]
 #                  ChatGPT account must be entitled to the one you pick.
 #
 # Metered API: a vendor SDK with a per-token bill.
+#   "openrouter" — the default. 200+ models from every vendor behind one key,
+#                  so [models] can mix vendors per agent in one session. Set
+#                  OPENROUTER_API_KEY. Models: "anthropic/claude-opus-4-7",
+#                  "openai/gpt-5", "google/gemini-3-pro".
 #   "anthropic"  — Claude via the Anthropic SDK. The only backend with prompt
 #                  cache breakpoints and the Batch API. Set ANTHROPIC_API_KEY.
+#                  Models: "claude-opus-4-7", "claude-sonnet-4-6".
 #   "openai"     — OpenAI Chat Completions. Set OPENAI_API_KEY.
-#   "openrouter" — OpenRouter; 200+ models from every vendor behind one key.
-#                  Set OPENROUTER_API_KEY. Models: "anthropic/claude-opus-4-7",
-#                  "openai/gpt-5", "google/gemini-3-pro".
 #   "gemini"     — Google Gemini via OpenAI-compat endpoint. Set
 #                  GEMINI_API_KEY. Models: "gemini-3-flash", "gemini-3-pro",
 #                  "gemini-2.5-pro".
@@ -194,8 +214,12 @@ classifier_warn_categories = ["dual_use_bio"]
 #   "ollama"     — local Ollama at localhost:11434. No key needed.
 #   "openai_compatible" — any other OpenAI-compatible endpoint; set
 #                  [llm.openai] base_url.
+#
+# NOTE: OPENAI_API_KEY takes precedence over every OpenAI-compatible preset's
+# own key, including OPENROUTER_API_KEY. A stray one in your environment gets
+# sent to OpenRouter and rejected — unset it, or set only the preset's key.
 [llm]
-provider = "anthropic"
+provider = "openrouter"
 
 [llm.claude_cli]
 binary = "claude"

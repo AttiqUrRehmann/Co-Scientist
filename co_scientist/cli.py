@@ -54,7 +54,14 @@ def _main(
 
 def _require_backend(cfg) -> None:
     """Abort early if the configured backend has no usable credentials."""
-    from .llm.provider import check_backend
+    from .llm.provider import check_backend, check_models
+
+    # A warning, not a refusal: the check is a naming heuristic, and an exotic
+    # but valid endpoint should not be blocked by it. Printed here because this
+    # runs before every session, and the alternative is finding out at the first
+    # model call — a 404 once the session is already going.
+    for problem in check_models(cfg):
+        console.print(f"[yellow]warning:[/yellow] {problem}")
 
     status = check_backend(cfg)
     if status.ok:
@@ -85,10 +92,11 @@ def doctor(ctx: typer.Context) -> None:
     handshake, but never makes a model call.
     """
     cfg, _ = ctx.obj
-    from .llm.provider import CLI_BACKENDS, check_backend
+    from .llm.provider import CLI_BACKENDS, check_backend, check_models
 
     status = check_backend(cfg)
     is_cli = status.backend in CLI_BACKENDS
+    model_problems = check_models(cfg)
 
     tbl = Table(title="co-scientist doctor", show_header=False, box=None)
     tbl.add_row("backend", status.backend)
@@ -98,10 +106,16 @@ def doctor(ctx: typer.Context) -> None:
             "binary", status.binary_path or f"[red]{status.binary} not found[/red]"
         )
         tbl.add_row("version", status.version or "[red]—[/red]")
-    tbl.add_row(
-        "subscription" if is_cli else "credentials",
-        "[green]signed in[/green]" if status.authenticated else "[red]no[/red]",
-    )
+    if is_cli:
+        tbl.add_row(
+            "subscription",
+            "[green]signed in[/green]" if status.authenticated else "[red]no[/red]",
+        )
+    else:
+        tbl.add_row(
+            "credentials",
+            "[green]ok[/green]" if status.authenticated else "[red]missing[/red]",
+        )
     tbl.add_row("detail", status.detail)
 
     # The MCP server exists to give a CLI backend forced tool use and URL
@@ -116,8 +130,17 @@ def doctor(ctx: typer.Context) -> None:
         if ok_mcp:
             tbl.add_row("MCP tools", mcp_detail)
 
+    tbl.add_row(
+        "models",
+        f"{cfg.models.generation} (+{len(vars(cfg.models)) - 1} more)"
+        if not model_problems
+        else f"[yellow]{len(model_problems)} look like another provider's ids[/yellow]",
+    )
     tbl.add_row("embeddings", _embeddings_row(cfg))
     console.print(tbl)
+
+    for problem in model_problems:
+        console.print(f"[yellow]warning:[/yellow] {problem}")
 
     if not (status.ok and ok_mcp):
         raise typer.Exit(1)
@@ -200,7 +223,8 @@ def init(ctx: typer.Context) -> None:
         tbl.add_row("CLI", status.version or "[red]not found[/red]")
     tbl.add_row(
         "subscription" if is_cli else "credentials",
-        "yes" if status.authenticated else "[red]no[/red]",
+        ("yes" if is_cli else "ok") if status.authenticated
+        else ("[red]no[/red]" if is_cli else "[red]missing[/red]"),
     )
     tbl.add_row("embeddings", _embeddings_row(cfg))
     tbl.add_row("science-skills", cfg.science_skills.path)
