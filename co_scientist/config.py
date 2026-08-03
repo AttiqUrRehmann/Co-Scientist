@@ -37,6 +37,17 @@ class ScienceSkillsCfg(BaseModel):
 
 
 class EmbeddingsCfg(BaseModel):
+    """Embeddings are chosen independently of the reasoning backend.
+
+    No agent CLI exposes an embedding endpoint, so under `claude_cli` /
+    `codex_cli` this is the one place a hosted key is still useful. With no key
+    at all it degrades to the local hash embedder rather than failing — a
+    session with weaker dedup beats no session.
+
+    Changing `dim` invalidates every FAISS index already on disk; the store
+    detects the mismatch and rebuilds rather than corrupting the index.
+    """
+
     provider: str = "voyage"
     model: str = "voyage-3-large"
     dim: int = 1024
@@ -94,6 +105,19 @@ class BudgetSharesCfg(BaseModel):
 
 
 class ModelsCfg(BaseModel):
+    """Per-agent model selection, interpreted by the configured backend.
+
+    Values go verbatim to the vendor SDK, or to the CLI's `--model` flag. The
+    defaults are full Anthropic ids because those work under both `anthropic`
+    and `claude_cli` (Claude Code's `--model` accepts a full id as readily as an
+    alias like "opus"), and because `routing.py` prices and gates thinking
+    budgets off the model name — an alias matches neither.
+
+    Switching to another family means replacing these: OpenRouter wants
+    "anthropic/claude-opus-4-7", Gemini wants "gemini-3-pro", Codex wants a
+    Codex model id.
+    """
+
     parse_goal: str = "claude-sonnet-4-6"
     generation: str = "claude-opus-4-7"
     reflection: str = "claude-opus-4-7"
@@ -164,7 +188,7 @@ class WebFetchCfg(BaseModel):
 
 
 class CodeExecCfg(BaseModel):
-    provider: str = "anthropic"
+    provider: str = "local"
     local_cpu_seconds: int = 30
     local_mem_mb: int = 512
 
@@ -209,6 +233,31 @@ class OpenRouterProviderCfg(BaseModel):
     title: str = ""
 
 
+class ClaudeCliCfg(BaseModel):
+    """Settings for the `claude -p` backend (Claude Code, subscription auth)."""
+
+    binary: str = "claude"
+    permission_mode: str = "dontAsk"
+    timeout_seconds: int = 900
+    max_parallel: int = 3
+    """Concurrent CLI processes. Bounded by the subscription's rate limit
+    rather than by CPU, so this is deliberately lower than `run.concurrency`."""
+    replace_system_prompt: bool = True
+    """Pass `--system-prompt` (replace) rather than `--append-system-prompt`.
+
+    Replacing drops Claude Code's own scaffolding, which otherwise costs about
+    19k cache-creation plus 24k cache-read tokens on every single call."""
+
+
+class CodexCliCfg(BaseModel):
+    """Settings for the `codex exec` backend (Codex, ChatGPT subscription)."""
+
+    binary: str = "codex"
+    sandbox: str = "read-only"
+    timeout_seconds: int = 900
+    max_parallel: int = 3
+
+
 ThinkingLevel = Literal["default", "minimal", "low", "medium", "high"]
 
 
@@ -225,9 +274,22 @@ class GeminiProviderCfg(BaseModel):
 
 
 class LLMCfg(BaseModel):
-    """Choose which LLM vendor backs the agents.
+    """Choose what backs the agents: a metered API, or a subscription CLI.
 
-    Supported values:
+    **Subscription CLI** — drives a locally installed agent harness over its
+    own OAuth login. No API key is involved, and any present in the
+    environment are stripped from the subprocess so a call cannot silently
+    fall back to metered billing.
+
+    - "claude_cli" — `claude -p` (Claude Code). `[models]` values are passed
+      to `--model`, so both aliases ("opus", "sonnet", "haiku") and full ids
+      ("claude-sonnet-4-6") work. Tune under [llm.claude_cli].
+    - "codex_cli" — `codex exec` (Codex). `[models]` values are Codex model
+      ids; a ChatGPT account must be entitled to the model you pick.
+      Tune under [llm.codex_cli].
+
+    **Metered API** — a vendor SDK with a per-token bill.
+
     - "anthropic" — Claude via the official Anthropic SDK (default). Cache
       breakpoints, extended thinking, and the Batch API are only available
       under this provider.
@@ -247,6 +309,9 @@ class LLMCfg(BaseModel):
     - "openai_compatible" — same client as `openai` but allows
       `llm.openai.base_url` to point at any other OpenAI-compatible
       endpoint not yet covered by a preset.
+
+    Note that `[models]` is interpreted by whichever backend is selected, so
+    switching families generally means revisiting it.
     """
 
     provider: str = "anthropic"
@@ -254,6 +319,8 @@ class LLMCfg(BaseModel):
     anthropic: AnthropicProviderCfg = Field(default_factory=AnthropicProviderCfg)
     openrouter: OpenRouterProviderCfg = Field(default_factory=OpenRouterProviderCfg)
     gemini: GeminiProviderCfg = Field(default_factory=GeminiProviderCfg)
+    claude_cli: ClaudeCliCfg = Field(default_factory=ClaudeCliCfg)
+    codex_cli: CodexCliCfg = Field(default_factory=CodexCliCfg)
 
 
 class WebUICfg(BaseModel):
@@ -262,7 +329,15 @@ class WebUICfg(BaseModel):
 
 
 class Secrets(BaseSettings):
-    """Secrets pulled from env only. Empty string means 'not configured'."""
+    """Secrets pulled from env only. Empty string means 'not configured'.
+
+    Which of these matter depends on `[llm] provider`. Under an API provider
+    the matching LLM key is required. Under `claude_cli` / `codex_cli` none of
+    the LLM keys are used — reasoning runs on the CLI's subscription login, and
+    `cli_backend.BILLING_ENV_VARS` strips them from every subprocess so a call
+    cannot silently fall back to metered billing. The embedding and data-source
+    keys apply either way.
+    """
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -357,11 +432,19 @@ def load_config(extra_path: Path | None = None) -> Config:
     return cfg
 
 
-def has_anthropic_key(cfg: Config) -> bool:
-    return bool(cfg.secrets.ANTHROPIC_API_KEY or os.environ.get("ANTHROPIC_API_KEY"))
+def backend_binary(cfg: Config) -> str:
+    """Name of the agent CLI the configured backend drives, or '' for an API."""
+    name = (getattr(cfg.llm, "provider", "anthropic") or "anthropic").strip().lower()
+    if name == "codex_cli":
+        return cfg.llm.codex_cli.binary
+    if name == "claude_cli":
+        return cfg.llm.claude_cli.binary
+    return ""
 
 
 # Env var names per provider preset (see llm/provider.py KNOWN_PROVIDERS).
+# An empty string means the backend needs no LLM key at all: Ollama serves
+# locally, and the CLI backends authenticate with a subscription login.
 _PROVIDER_ENV_VARS: dict[str, str] = {
     "anthropic":          "ANTHROPIC_API_KEY",
     "openai":             "OPENAI_API_KEY",
@@ -372,7 +455,9 @@ _PROVIDER_ENV_VARS: dict[str, str] = {
     "groq":               "GROQ_API_KEY",
     "together":           "TOGETHER_API_KEY",
     "mistral":            "MISTRAL_API_KEY",
-    "ollama":             "",   # keyless
+    "ollama":             "",   # keyless — local endpoint
+    "claude_cli":         "",   # keyless — Claude Code subscription login
+    "codex_cli":          "",   # keyless — ChatGPT subscription login
 }
 
 
@@ -384,7 +469,7 @@ def provider_key_env(cfg: Config) -> str:
 
 def has_llm_key(cfg: Config) -> bool:
     """True if the configured provider's API key is available, OR the provider
-    is keyless (Ollama)."""
+    is keyless (Ollama, and the subscription CLI backends)."""
     env_var = provider_key_env(cfg)
     if not env_var:
         return True   # keyless provider
@@ -398,3 +483,15 @@ def has_llm_key(cfg: Config) -> bool:
     ):
         return True
     return bool(getattr(cfg.secrets, env_var, "") or os.environ.get(env_var))
+
+
+def has_embeddings_key(cfg: Config) -> bool:
+    """True if real embeddings are available for the configured provider.
+
+    Otherwise dedup falls back to the hash embedder (see vectors/embedder.py).
+    `make_embedder` walks Voyage → OpenAI → hash, so either key counts.
+    """
+    def _set(name: str) -> bool:
+        return bool(getattr(cfg.secrets, name, "") or os.environ.get(name))
+
+    return _set("VOYAGE_API_KEY") or _set("OPENAI_API_KEY")

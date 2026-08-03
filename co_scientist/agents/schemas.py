@@ -1,8 +1,10 @@
-"""Shared Anthropic tool-use schemas for structured outputs.
+"""Shared tool-use schemas for structured outputs.
 
-Each agent gets one or more of these as required tool calls. Using tool-use
-schemas (rather than "respond in JSON") is the most reliable structured-output
-mechanism on the Anthropic API.
+Each agent gets one or more of these as required tool calls. Tool-use schemas
+(rather than "respond in JSON") remain the most reliable structured-output
+mechanism, and they are what the MCP server in `co_scientist/mcp/` serves to
+the CLI backends — validated at the tool boundary, exactly as the API used to
+validate them.
 """
 
 from __future__ import annotations
@@ -139,6 +141,63 @@ RECORD_SYSTEM_FEEDBACK_TOOL: dict[str, Any] = {
             "narrative":             {"type": "string"},
         },
         "required": ["narrative"],
+    },
+}
+
+
+RECORD_SAFETY_ASSESSMENT_TOOL: dict[str, Any] = {
+    "name": "record_safety_assessment",
+    "description": "Record a structured safety assessment of input text.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "categories": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "none",
+                        "dual_use_bio",
+                        "cbrn",
+                        "weapons",
+                        "illicit_synthesis",
+                        "csam",
+                    ],
+                },
+                "description": "All categories that apply. Use ['none'] if benign.",
+            },
+            "confidence": {
+                "type": "number", "minimum": 0, "maximum": 1,
+                "description": "0..1 confidence in the worst-case categorization.",
+            },
+            "rationale": {"type": "string"},
+        },
+        "required": ["categories", "confidence", "rationale"],
+    },
+}
+
+
+RECORD_RUBRIC_SCORE_TOOL: dict[str, Any] = {
+    "name": "record_rubric_score",
+    "description": "Record per-criterion 1-5 scores and a brief rationale.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "scores": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name":      {"type": "string"},
+                        "score":     {"type": "integer", "minimum": 1, "maximum": 5},
+                        "rationale": {"type": "string"},
+                    },
+                    "required": ["name", "score", "rationale"],
+                },
+            },
+            "overall_notes": {"type": "string"},
+        },
+        "required": ["scores"],
     },
 }
 

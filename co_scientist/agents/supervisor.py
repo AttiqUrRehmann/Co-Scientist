@@ -26,15 +26,15 @@ import aiosqlite
 
 from .. import ids
 from ..config import Config
-from ..llm.anthropic_client import (
-    AgentCallSpec,
-    CachedBlock,
-    CallContext,
-)
 from ..llm.budgets import TokenBudget
 from ..llm.prompts import render
 from ..llm.provider import get_provider
 from ..llm.routing import route
+from ..llm.types import (
+    AgentCallSpec,
+    CachedBlock,
+    CallContext,
+)
 from ..logging import bind, get_logger
 from ..models import ResearchPlan, Session, Task
 from ..orchestrator.events import GLOBAL_BUS

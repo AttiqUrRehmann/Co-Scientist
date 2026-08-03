@@ -76,12 +76,23 @@ class VoyageEmbedder:
 # OpenAI fallback
 
 
+# Used when falling back from a non-OpenAI provider, where `embeddings.model`
+# names someone else's model. `-large` shortened to the configured dim beats
+# `-small` at that same dim, and the API's `dimensions` parameter makes the
+# shortening free, so there is no reason to fall back to the weaker model.
+FALLBACK_OPENAI_MODEL = "text-embedding-3-large"
+
+
 class OpenAIEmbedder:
     def __init__(self, cfg: Config) -> None:
-        # Override dim if running OpenAI's text-embedding-3-small (1536) or -large (3072).
-        self.model = cfg.embeddings.model if cfg.embeddings.provider == "openai" else "text-embedding-3-small"
-        # text-embedding-3-small native dim is 1536, but the API supports a `dimensions` parameter
-        # to shrink. We keep the configured dim and pass it explicitly.
+        self.model = (
+            cfg.embeddings.model
+            if cfg.embeddings.provider == "openai"
+            else FALLBACK_OPENAI_MODEL
+        )
+        # Native dims are 1536 (-small) and 3072 (-large); the API's
+        # `dimensions` parameter shrinks either, so we keep the configured dim
+        # and pass it explicitly. That also keeps existing FAISS indices valid.
         self.dim = cfg.embeddings.dim
         self._cfg = cfg
 

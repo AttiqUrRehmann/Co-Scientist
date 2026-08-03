@@ -10,14 +10,19 @@ Two actions:
 
 from __future__ import annotations
 
+import asyncio
+import json
 from datetime import UTC, datetime
+from typing import Any
 
 from .. import ids
-from ..llm.anthropic_client import AgentCallSpec, CachedBlock, CallContext
 from ..llm.prompts import render
 from ..llm.routing import route
+from ..llm.types import AgentCallSpec, CachedBlock, CallContext
 from ..logging import get_logger
 from ..models import SystemFeedback, Task, TaskResult
+from ..models.hypothesis import CitedPaper
+from ..models.review import Evidence
 from ..storage.artifacts import write_json, write_text
 from ..storage.repos import feedback as fb_repo
 from ..storage.repos import hypotheses as hyp_repo
@@ -64,6 +69,7 @@ class MetaReviewAgent(BaseAgent):
             preferences="; ".join(session.research_plan.preferences),
             reviews=reviews_block,
             debate_rationales=debate_block,
+            sources=self._source_block(*(await self._hydrate_sources([], reviews))),
         )
         r = route(self.deps.cfg, "metareview", "system")
         spec = AgentCallSpec(
@@ -113,6 +119,118 @@ class MetaReviewAgent(BaseAgent):
             extra={"feedback_id": fb_id, "n_reviews": len(reviews)},
         )
 
+    # ----------------------------- sources ----------------------------- #
+
+    async def _read_record(self, artifact_path: str | None) -> dict[str, Any]:
+        """Load the `record` payload of a hypothesis/review artifact.
+
+        Citations and evidence are deliberately not columns — the repos note
+        "citations live in the JSON artifact, not the row" — so the only way to
+        recover them is to read the artifact back off disk.
+        """
+        if not artifact_path:
+            return {}
+        base = self.deps.cfg.data_dir.resolve()
+        try:
+            path = (self.deps.cfg.data_dir / artifact_path).resolve()
+            path.relative_to(base)          # refuse to read outside data_dir
+        except (ValueError, OSError):
+            return {}
+
+        def _load() -> dict[str, Any]:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return {}
+            record = payload.get("record")
+            return record if isinstance(record, dict) else {}
+
+        return await asyncio.to_thread(_load)
+
+    async def _hydrate_sources(self, hypotheses: list, reviews: list) -> tuple[list, list]:
+        """Refill `citations` / `evidence` from artifacts before formatting."""
+        hyps_out = []
+        for h in hypotheses:
+            record = await self._read_record(getattr(h, "artifact_path", None))
+            cites = []
+            for c in record.get("citations") or []:
+                if isinstance(c, dict) and c.get("url") and c.get("title"):
+                    cites.append(CitedPaper(
+                        title=str(c["title"]), url=str(c["url"]),
+                        excerpt=c.get("excerpt"), doi=c.get("doi"),
+                        year=c.get("year") if isinstance(c.get("year"), int) else None,
+                    ))
+            hyps_out.append(h.model_copy(update={"citations": cites}))
+
+        reviews_out = []
+        for r in reviews:
+            record = await self._read_record(getattr(r, "artifact_path", None))
+            evidence = []
+            for e in record.get("evidence") or []:
+                if isinstance(e, dict) and e.get("url"):
+                    evidence.append(Evidence(
+                        claim=str(e.get("claim", "")),
+                        url=str(e["url"]),
+                        excerpt=str(e.get("excerpt", "")),
+                    ))
+            reviews_out.append(r.model_copy(update={"evidence": evidence}))
+
+        return hyps_out, reviews_out
+
+    @staticmethod
+    def _source_block(hypotheses: list, reviews: list, *, limit: int = 40) -> str:
+        """The literature the session actually saw, deduped by URL.
+
+        Meta-review runs without tools, so unless we hand it the sources
+        gathered downstream it has nothing to cite — and correctly refuses to
+        invent any, producing an overview with no references at all. Both
+        `Hypothesis.citations` and `Review.evidence` carry verified URLs
+        (verified in the sense that Generation/Reflection could only record a
+        URL that appeared in one of their own tool results).
+        """
+        seen: dict[str, dict[str, Any]] = {}
+
+        for h in hypotheses:
+            for c in getattr(h, "citations", []) or []:
+                url = getattr(c, "url", "")
+                if url and url not in seen:
+                    seen[url] = {
+                        "title": getattr(c, "title", "") or "(untitled)",
+                        "excerpt": getattr(c, "excerpt", "") or "",
+                        "refs": [],
+                    }
+                if url:
+                    seen[url]["refs"].append(h.id)
+
+        for r in reviews:
+            for ev in getattr(r, "evidence", []) or []:
+                url = getattr(ev, "url", "")
+                if not url:
+                    continue
+                if url not in seen:
+                    seen[url] = {
+                        "title": getattr(ev, "claim", "") or "(claim)",
+                        "excerpt": getattr(ev, "excerpt", "") or "",
+                        "refs": [],
+                    }
+                seen[url]["refs"].append(r.hypothesis_id)
+
+        if not seen:
+            return ""
+
+        lines: list[str] = []
+        for i, (url, meta) in enumerate(list(seen.items())[:limit], start=1):
+            refs = ", ".join(dict.fromkeys(meta["refs"]))[:120]
+            line = f"- [S{i}] {meta['title'][:200]}\n  {url}"
+            if meta["excerpt"]:
+                line += f'\n  > "{meta["excerpt"][:300]}"'
+            if refs:
+                line += f"\n  (supports: {refs})"
+            lines.append(line)
+        if len(seen) > limit:
+            lines.append(f"- …and {len(seen) - limit} more sources not shown.")
+        return "\n".join(lines)
+
     # ----------------------------- final overview ----------------------------- #
 
     async def _final_overview(self, task: Task) -> TaskResult:
@@ -153,12 +271,17 @@ class MetaReviewAgent(BaseAgent):
 
         latest_fb = await fb_repo.latest_system_feedback(self.deps.db, session.id)
 
+        all_reviews = [rv for group in reviews_by_hyp.values() for rv in group]
+        hydrated_hyps, hydrated_reviews = await self._hydrate_sources(top, all_reviews)
+        sources = self._source_block(hydrated_hyps, hydrated_reviews)
+
         prompt = render(
             "metareview.final",
             goal=session.research_plan.objective,
             preferences="; ".join(session.research_plan.preferences),
             system_feedback=latest_fb.text if latest_fb else "",
             top_hypotheses_block=top_block,
+            sources=sources,
         )
         r = route(self.deps.cfg, "metareview", "final")
         spec = AgentCallSpec(

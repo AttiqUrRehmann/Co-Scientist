@@ -15,13 +15,29 @@ from ..config import Config
 # pricing before any production use. Unknown models fall back to a
 # conservative sonnet-class default.
 PRICE_TABLE: dict[str, dict[str, float]] = {
-    # Anthropic
-    "claude-opus-4-7":            {"input": 15.0,  "output": 75.0,  "cache_write": 18.75, "cache_read": 1.5},
+    # Claude Code CLI aliases — what `[models]` holds under the claude_cli
+    # backend. Nothing is actually billed per token on a subscription; these
+    # drive the equivalent-cost gauge and the pre-flight estimate.
+    "opus":                       {"input":  5.0,  "output": 25.0,  "cache_write":  6.25, "cache_read": 0.5},
+    "sonnet":                     {"input":  3.0,  "output": 15.0,  "cache_write":  3.75, "cache_read": 0.3},
+    "haiku":                      {"input":  1.0,  "output":  5.0,  "cache_write":  1.25, "cache_read": 0.1},
+    # Anthropic model ids
+    "claude-opus-5":              {"input":  5.0,  "output": 25.0,  "cache_write":  6.25, "cache_read": 0.5},
+    "claude-sonnet-5":            {"input":  3.0,  "output": 15.0,  "cache_write":  3.75, "cache_read": 0.3},
+    "claude-haiku-4-5":           {"input":  1.0,  "output":  5.0,  "cache_write":  1.25, "cache_read": 0.1},
+    "claude-fable-5":             {"input": 10.0,  "output": 50.0,  "cache_write": 12.5,  "cache_read": 1.0},
+    "claude-opus-4-8":            {"input":  5.0,  "output": 25.0,  "cache_write":  6.25, "cache_read": 0.5},
+    "claude-opus-4-7":            {"input":  5.0,  "output": 25.0,  "cache_write":  6.25, "cache_read": 0.5},
     "claude-sonnet-4-6":          {"input":  3.0,  "output": 15.0,  "cache_write":  3.75, "cache_read": 0.3},
     "claude-haiku-4-5-20251001":  {"input":  1.0,  "output":  5.0,  "cache_write":  1.25, "cache_read": 0.1},
     "anthropic/claude-haiku-4.5": {"input":  1.0,  "output":  5.0,  "cache_write":  1.25, "cache_read": 0.1},
     "anthropic/claude-3.5-haiku": {"input":  0.8,  "output":  4.0,  "cache_write":  1.0,  "cache_read": 0.08},
-    # OpenAI (approximate; verify on platform.openai.com/docs/pricing)
+    # OpenAI (approximate; verify on platform.openai.com/docs/pricing).
+    # "gpt-5.6" is an alias that routes to gpt-5.6-sol.
+    "gpt-5.6":                    {"input":  5.0,  "output": 30.0,  "cache_write":  5.0,  "cache_read": 0.5},
+    "gpt-5.6-sol":                {"input":  5.0,  "output": 30.0,  "cache_write":  5.0,  "cache_read": 0.5},
+    "gpt-5.6-terra":              {"input":  2.0,  "output": 12.0,  "cache_write":  2.0,  "cache_read": 0.2},
+    "gpt-5.6-luna":               {"input":  0.2,  "output":  1.2,  "cache_write":  0.2,  "cache_read": 0.02},
     "gpt-5":                      {"input":  5.0,  "output": 20.0,  "cache_write":  5.0,  "cache_read": 0.5},
     "gpt-4.1":                    {"input":  2.0,  "output":  8.0,  "cache_write":  2.0,  "cache_read": 0.2},
     "gpt-4o":                     {"input":  2.5,  "output": 10.0,  "cache_write":  2.5,  "cache_read": 0.25},
@@ -44,7 +60,7 @@ PRICE_TABLE: dict[str, dict[str, float]] = {
     "mistral-large-latest":       {"input":  2.0,  "output":  6.0,  "cache_write":  2.0,  "cache_read": 0.2},
     "llama-3.3-70b":              {"input":  0.6,  "output":  0.6,  "cache_write":  0.6,  "cache_read": 0.6},
     # OpenRouter passes through the upstream provider's price; common routes:
-    "anthropic/claude-opus-4-7":      {"input": 15.0,  "output": 75.0,  "cache_write": 18.75, "cache_read": 1.5},
+    "anthropic/claude-opus-4-7":      {"input":  5.0,  "output": 25.0,  "cache_write":  6.25, "cache_read": 0.5},
     "anthropic/claude-sonnet-4-6":    {"input":  3.0,  "output": 15.0,  "cache_write":  3.75, "cache_read": 0.3},
     "anthropic/claude-3.5-sonnet":    {"input":  3.0,  "output": 15.0,  "cache_write":  3.75, "cache_read": 0.3},
     "openai/gpt-5":                   {"input":  5.0,  "output": 20.0,  "cache_write":  5.0,  "cache_read": 0.5},
@@ -83,13 +99,17 @@ _FAMILY_PRICE_HINTS: list[tuple[str, dict[str, float]]] = [
     ("4o-mini",    {"input": 0.15, "output": 0.6,  "cache_write": 0.15, "cache_read": 0.075}),
     ("mini",       {"input": 1.1,  "output": 4.4,  "cache_write": 1.1,  "cache_read": 0.55}),
     ("nano",       {"input": 0.1,  "output": 0.4,  "cache_write": 0.1,  "cache_read": 0.025}),
+    ("luna",       {"input": 0.2,  "output": 1.2,  "cache_write": 0.2,  "cache_read": 0.02}),
     # Mid tier
+    ("terra",      {"input": 2.0,  "output": 12.0, "cache_write": 2.0,  "cache_read": 0.2}),
     ("sonnet",     {"input": 3.0,  "output": 15.0, "cache_write": 3.75, "cache_read": 0.3}),
     ("gpt-4o",     {"input": 2.5,  "output": 10.0, "cache_write": 2.5,  "cache_read": 0.25}),
     ("gpt-4.1",    {"input": 2.0,  "output":  8.0, "cache_write": 2.0,  "cache_read": 0.2}),
     ("gemini",     {"input": 1.25, "output": 10.0, "cache_write": 1.25, "cache_read": 0.3}),
     # High tier
-    ("opus",       {"input": 15.0, "output": 75.0, "cache_write": 18.75,"cache_read": 1.5}),
+    ("fable",      {"input": 10.0, "output": 50.0, "cache_write": 12.5, "cache_read": 1.0}),
+    ("opus",       {"input": 5.0,  "output": 25.0, "cache_write": 6.25, "cache_read": 0.5}),
+    ("gpt-5.6",    {"input": 5.0,  "output": 30.0, "cache_write": 5.0,  "cache_read": 0.5}),
     ("gpt-5",      {"input": 5.0,  "output": 20.0, "cache_write": 5.0,  "cache_read": 0.5}),
     ("o3",         {"input": 2.0,  "output":  8.0, "cache_write": 2.0,  "cache_read": 0.5}),
     ("o1",         {"input": 15.0, "output": 60.0, "cache_write": 15.0, "cache_read": 7.5}),
@@ -112,12 +132,42 @@ def _price_for_model(model: str) -> dict[str, float]:
     return _FALLBACK_PRICE
 
 
-# Soft fallback chain: if a degraded route is requested, walk this list once.
-DEGRADE_CHAIN = [
-    "claude-opus-4-7",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5-20251001",
-]
+# Soft fallback chains: if a degraded route is requested, walk one step down.
+#
+# One chain per naming style we ship, because `[models]` is interpreted by
+# whichever backend is configured — full Anthropic ids under `anthropic`, either
+# those or bare aliases under `claude_cli`, vendor-prefixed ids under
+# `openrouter`. A single exact-match list in one style would silently match none
+# of the others, and degradation would become a no-op instead of an error.
+#
+# Substring rewriting is deliberately avoided: turning "claude-opus-4-7" into
+# "claude-sonnet-4-7" would invent a model id that does not exist.
+DEGRADE_CHAINS: tuple[list[str], ...] = (
+    ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+    ["opus", "sonnet", "haiku"],
+    [
+        "anthropic/claude-opus-4-7",
+        "anthropic/claude-sonnet-4-6",
+        "anthropic/claude-haiku-4-5",
+    ],
+)
+
+# The canonical chain, for callers that just want the default family.
+DEGRADE_CHAIN = DEGRADE_CHAINS[0]
+
+
+def degrade_model(model: str) -> str:
+    """One step down whichever chain holds `model`; unchanged if it's in none.
+
+    Leaving an unrecognized model alone is the safe failure: a degraded route
+    that keeps the same model costs more than intended, whereas guessing at a
+    cheaper id risks naming a model the endpoint will reject outright.
+    """
+    for chain in DEGRADE_CHAINS:
+        if model in chain:
+            i = chain.index(model)
+            return chain[i + 1] if i + 1 < len(chain) else model
+    return model
 
 
 # never-degrade modes — config flag overrides require explicit user override
@@ -176,14 +226,14 @@ def route(cfg: Config, agent: str, mode: str | None = None, *, degraded: bool = 
     }.get((agent, mode), m.generation)
 
     full_mode = f"{agent}.{mode}" if mode else agent
-    if degraded and full_mode not in NEVER_DEGRADE and model in DEGRADE_CHAIN:
-        i = DEGRADE_CHAIN.index(model)
-        if i + 1 < len(DEGRADE_CHAIN):
-            model = DEGRADE_CHAIN[i + 1]
+    if degraded and full_mode not in NEVER_DEGRADE:
+        model = degrade_model(model)
 
     th = thinking_budget_for(cfg, full_mode) if not degraded else 0
-    # Thinking only on Opus by convention.
-    if not model.startswith("claude-opus"):
+    # Thinking only on Opus by convention. Substring rather than prefix so the
+    # CLI backends' bare aliases ("opus") match alongside API ids
+    # ("claude-opus-5").
+    if "opus" not in model.lower():
         th = 0
 
     return ModelRoute(agent=agent, mode=mode or "", model=model, thinking_tokens=th)

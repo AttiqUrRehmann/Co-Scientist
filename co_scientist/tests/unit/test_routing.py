@@ -19,12 +19,20 @@ def test_default_routes_use_opus_for_heavy_modes() -> None:
 
 
 def test_thinking_only_on_opus() -> None:
+    """Matched by substring so the CLI alias "opus" counts alongside
+    "claude-opus-5"."""
     cfg = Config()
     r = route(cfg, "reflection", "verification")
-    if r.model.startswith("claude-opus"):
+    if "opus" in r.model.lower():
         assert r.thinking_tokens == cfg.thinking.reflection_verification
     else:
         assert r.thinking_tokens == 0
+
+
+def test_thinking_is_zero_for_non_opus_routes() -> None:
+    cfg = Config()
+    assert "opus" not in cfg.models.ranking_pairwise.lower()
+    assert route(cfg, "ranking", "pairwise").thinking_tokens == 0
 
 
 def test_degrade_walks_chain_once() -> None:
@@ -91,12 +99,16 @@ def test_unknown_mini_model_uses_mini_tier_pricing() -> None:
 def test_unknown_opus_class_model_uses_opus_pricing() -> None:
     """Family hints map upward as well: an unknown opus-named model should
     NOT silently price as a sonnet (and risk underbudgeting)."""
-    cost = estimate_cost_usd(
+    opus = estimate_cost_usd(
         model="anthropic/claude-99-opus-experimental",
         input_tokens=1_000_000, output_tokens=1_000_000,
     )
-    # opus tier: 15 + 75 = $90/M+M
-    assert cost > 50.0
+    sonnet = estimate_cost_usd(
+        model="claude-sonnet-5", input_tokens=1_000_000, output_tokens=1_000_000,
+    )
+    # opus tier: 5 + 25 = $30/M+M, versus sonnet's 3 + 15 = $18/M+M.
+    assert opus == 30.0
+    assert opus > sonnet
 
 
 def test_known_model_takes_precedence_over_family_hint() -> None:
@@ -118,3 +130,31 @@ def test_completely_unknown_model_uses_conservative_fallback() -> None:
     )
     # Sonnet-class fallback: 3 + 15 = $18/M+M
     assert 15.0 < cost < 25.0
+
+
+def test_degrade_works_for_every_naming_style_we_ship() -> None:
+    """`[models]` holds full ids, CLI aliases, or vendor-prefixed ids depending
+    on the configured backend. An exact-match chain in one style silently made
+    degradation a no-op for the others."""
+    from co_scientist.llm.routing import degrade_model
+
+    assert degrade_model("claude-opus-4-7") == "claude-sonnet-4-6"
+    assert degrade_model("opus") == "sonnet"
+    assert degrade_model("anthropic/claude-opus-4-7") == "anthropic/claude-sonnet-4-6"
+
+
+def test_degrade_leaves_the_bottom_of_the_chain_and_unknown_models_alone() -> None:
+    from co_scientist.llm.routing import degrade_model
+
+    assert degrade_model("haiku") == "haiku"
+    assert degrade_model("claude-haiku-4-5-20251001") == "claude-haiku-4-5-20251001"
+    # Guessing a cheaper id for an unrecognized model risks naming one the
+    # endpoint rejects; costing more is the safer failure.
+    assert degrade_model("gemini-3-pro") == "gemini-3-pro"
+
+
+def test_degrade_still_respects_never_degrade_modes() -> None:
+    cfg = Config()
+    cfg.models.reflection = "opus"
+    r = route(cfg, "reflection", "verification", degraded=True)
+    assert r.model == "opus"

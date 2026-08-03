@@ -2,6 +2,17 @@
 
 Pilot results from every cross-model bench run on this codebase. See [`../README.md`](../README.md) for what the bench is and how to run it.
 
+> **These runs used the metered API backends.** Every bench below came from an
+> API preset (`paper`, `paper-aml*`, `frontier-aml-vs-raw`), which routes
+> candidates through OpenRouter and bills per token. Those presets still exist
+> and still reproduce — you need `OPENROUTER_API_KEY`.
+>
+> Runs from the **subscription CLI** presets (`claude-aml`,
+> `claude-aml-vs-raw`, `cross-backend-aml`) are **not comparable to these**.
+> The prompts and gold sets are identical, but under a CLI backend the tool loop
+> belongs to the CLI rather than to this repo, and the `$` column becomes a
+> reported equivalent cost rather than real spend. Compare within a family.
+
 _Auto-generated from `data/co_scientist.db` by_ _`python scripts/build_bench_report.py`._ _Re-run after any new `co-scientist bench` to refresh._
 
 ## How to read this doc

@@ -4,7 +4,7 @@ Scientist's research goal (verbatim):
 "{{ goal }}"
 
 Additional preferences from the scientist (may be empty):
-{{ preferences_text | default('(none provided)') }}
+{{ preferences_text | default('(none provided)', true) }}
 
 Your job:
 1. Extract the **objective** — a clear, atomic statement of what the scientist wants to investigate.

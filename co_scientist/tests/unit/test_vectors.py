@@ -56,21 +56,51 @@ async def test_faiss_offset_lookup(tmp_cfg) -> None:
     assert store.offset_of("missing") is None
 
 
+@pytest.mark.asyncio
+async def test_index_of_a_different_dim_is_rebuilt_not_reused(tmp_cfg) -> None:
+    """Changing the embedding model invalidates the vectors already stored.
+
+    Without the width check FAISS accepts the stale index and then fails deep
+    inside `add` with an assertion that names nothing useful.
+    """
+    store = FaissStore(tmp_cfg, "ses_dim", dim=8)
+    await store.load_or_create()
+    await store.add("hyp_1", _vec(1, 8))
+    await store.save()
+
+    # Same session, wider embeddings — as after switching embedding model.
+    reopened = FaissStore(tmp_cfg, "ses_dim", dim=16)
+    await reopened.load_or_create()
+
+    assert reopened.n == 0, "stale 8-d vectors must not survive into a 16-d index"
+    assert reopened.index.d == 16
+    assert reopened.offset_of("hyp_1") is None
+    # And the fresh index is usable at the new width.
+    await reopened.add("hyp_1", _vec(1, 16))
+    assert reopened.n == 1
+
+
 # ----------------------------- embedder fallback ----------------------------- #
 
 
 @pytest.mark.asyncio
 async def test_make_embedder_falls_back_to_hash_when_no_keys() -> None:
-    """Without VOYAGE_API_KEY or OPENAI_API_KEY, make_embedder should return
-    HashEmbedder so dedup / proximity degrade rather than crash."""
+    """Without OPENAI_API_KEY, make_embedder should return HashEmbedder so
+    dedup / proximity degrade rather than crash."""
+    import os
+
     from co_scientist.config import Config
     from co_scientist.vectors.embedder import HashEmbedder, make_embedder
 
     cfg = Config()
-    cfg.embeddings.provider = "voyage"
-    cfg.secrets.VOYAGE_API_KEY = ""
+    cfg.embeddings.provider = "openai"
     cfg.secrets.OPENAI_API_KEY = ""
-    emb = make_embedder(cfg)
+    saved = os.environ.pop("OPENAI_API_KEY", None)
+    try:
+        emb = make_embedder(cfg)
+    finally:
+        if saved is not None:
+            os.environ["OPENAI_API_KEY"] = saved
     assert isinstance(emb, HashEmbedder)
 
 
@@ -111,16 +141,40 @@ async def test_hash_embedder_similar_texts_have_higher_cosine() -> None:
 
 
 @pytest.mark.asyncio
-async def test_make_embedder_prefers_openai_when_voyage_missing_but_openai_set() -> None:
+async def test_openai_fallback_uses_large_at_the_configured_dim() -> None:
+    """Falling back from another provider must not also downgrade the model.
+
+    `embeddings.model` names a Voyage model here, so it cannot be forwarded to
+    OpenAI. The fallback picks `-large` shortened to the configured dim, rather
+    than `-small` at that dim — same vector width, better vectors, and existing
+    FAISS indices stay valid because the dim is unchanged.
+    """
+    from co_scientist.config import Config
+    from co_scientist.vectors.embedder import OpenAIEmbedder, make_embedder
+
+    cfg = Config()                       # provider="voyage", dim=1024
+    cfg.secrets.OPENAI_API_KEY = "sk-fake"
+    emb = make_embedder(cfg)
+    assert isinstance(emb, OpenAIEmbedder)
+    assert emb.model == "text-embedding-3-large"
+    assert emb.dim == cfg.embeddings.dim == 1024
+
+
+@pytest.mark.asyncio
+async def test_openai_as_the_configured_provider_honors_model_and_dim() -> None:
+    """Choosing OpenAI outright forwards `embeddings.model` verbatim."""
     from co_scientist.config import Config
     from co_scientist.vectors.embedder import OpenAIEmbedder, make_embedder
 
     cfg = Config()
-    cfg.embeddings.provider = "voyage"
-    cfg.secrets.VOYAGE_API_KEY = ""
+    cfg.embeddings.provider = "openai"
+    cfg.embeddings.model = "text-embedding-3-large"
+    cfg.embeddings.dim = 3072
     cfg.secrets.OPENAI_API_KEY = "sk-fake"
     emb = make_embedder(cfg)
     assert isinstance(emb, OpenAIEmbedder)
+    assert emb.model == "text-embedding-3-large"
+    assert emb.dim == 3072
 
 
 def test_fallback_warning_emits_once_per_process() -> None:
@@ -133,17 +187,22 @@ def test_fallback_warning_emits_once_per_process() -> None:
     logging capture. The set is the source of truth for the once-per-process
     contract.
     """
+    import os
+
     from co_scientist.config import Config
     from co_scientist.vectors import embedder as emb_mod
 
     emb_mod._reset_fallback_warned_for_tests()
     cfg = Config()
-    cfg.embeddings.provider = "voyage"
-    cfg.secrets.VOYAGE_API_KEY = ""
+    cfg.embeddings.provider = "openai"
     cfg.secrets.OPENAI_API_KEY = ""
-
-    for _ in range(50):
-        emb_mod.make_embedder(cfg)
+    saved = os.environ.pop("OPENAI_API_KEY", None)
+    try:
+        for _ in range(50):
+            emb_mod.make_embedder(cfg)
+    finally:
+        if saved is not None:
+            os.environ["OPENAI_API_KEY"] = saved
 
     # Exactly one warning marker recorded; subsequent calls hit the cache.
-    assert {"no_embedding_key_using_hash_fallback"} == emb_mod._FALLBACK_WARNED
+    assert {"openai_key_missing_using_hash_fallback"} == emb_mod._FALLBACK_WARNED

@@ -6,15 +6,18 @@ Adds:
 - Persists a Transcript row + a raw artifact (full messages array) on disk.
 - Helpers to build cache_control blocks at the canonical breakpoints.
 - Convenience for the standard agent tool-use loop (in tool_loop.py).
+
+The normalized request/response types this client speaks live in `types.py`,
+shared with every other backend (OpenAI-compatible and CLI-driven alike). They
+are re-exported below because a great deal of code — and most of the test
+suite — has imported them from here since before there was anywhere else.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -29,54 +32,22 @@ from ..storage.repos import sessions as sessions_repo
 from ..storage.repos import transcripts as transcripts_repo
 from .budgets import TokenBudget
 from .retry import RetryPolicy, with_retry
-from .routing import ModelRoute, estimate_cost_usd
+from .routing import estimate_cost_usd
+from .types import (
+    AgentCallSpec,
+    AnthropicResponse,
+    CachedBlock,
+    CallContext,
+    rough_token_count,
+)
 
-
-@dataclass
-class CallContext:
-    """Per-call metadata for accounting and persistence."""
-
-    session_id: str
-    task_id: str | None
-    agent: str
-    action: str
-    mode: str | None = None     # e.g. "literature", "verification"
-
-
-@dataclass
-class CachedBlock:
-    """One text block with optional cache_control marker."""
-
-    text: str
-    cache: bool = False         # True → emit cache_control: ephemeral
-
-
-@dataclass
-class AgentCallSpec:
-    """Inputs to one LLM call, before we serialize them into Anthropic's schema."""
-
-    route: ModelRoute
-    system_blocks: list[CachedBlock] = field(default_factory=list)
-    user_blocks: list[CachedBlock] = field(default_factory=list)
-    tools: list[dict[str, Any]] = field(default_factory=list)
-    tool_choice: dict[str, Any] | None = None      # e.g. {"type": "auto"} or {"type": "tool", "name": "..."}
-    max_output_tokens: int = 4096
-    stop_sequences: list[str] | None = None
-    extra_messages: list[dict[str, Any]] = field(default_factory=list)
-    """Appended *after* the user_blocks message — used for tool_use/tool_result threads."""
-
-
-@dataclass
-class AnthropicResponse:
-    """Lightweight wrapper around the raw API response, with accounting attached."""
-
-    raw: Any                       # anthropic.types.Message
-    transcript_id: str
-    cost_usd: float
-    input_tokens: int
-    output_tokens: int
-    cache_read: int
-    cache_write: int
+__all__ = [
+    "AgentCallSpec",
+    "AnthropicClient",
+    "AnthropicResponse",
+    "CachedBlock",
+    "CallContext",
+]
 
 
 class AnthropicClient:
@@ -261,21 +232,9 @@ def _build_blocks(blocks: Iterable[CachedBlock]) -> list[dict[str, Any]]:
     return out
 
 
-def _rough_token_count(spec: AgentCallSpec) -> int:
-    """Cheap heuristic: 1 token ≈ 4 chars. Used only for budget admission."""
-    n = 0
-    for b in spec.system_blocks:
-        n += len(b.text) // 4
-    for b in spec.user_blocks:
-        n += len(b.text) // 4
-    for m in spec.extra_messages:
-        n += len(json.dumps(m)) // 4
-    # Tool schemas are sent on every call and can dominate input on tool-heavy
-    # agents (generation, reflection). Skipping them systematically
-    # under-reserves the budget.
-    if spec.tools:
-        n += len(json.dumps(spec.tools)) // 4
-    return max(n, 32)
+# Shared with every other backend; the private alias is what this module and
+# openai_client.py have always called.
+_rough_token_count = rough_token_count
 
 
 def _redact(payload: dict[str, Any]) -> dict[str, Any]:

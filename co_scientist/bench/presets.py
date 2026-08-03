@@ -3,6 +3,21 @@
 Curated comparison setups so users can reproduce known benchmarks with one
 flag instead of typing N `--candidate` lines.
 
+Presets come in two families, matching the two backend families:
+
+- **API presets** (`paper*`, `frontier*`) route every candidate through
+  OpenRouter, which is what makes cross-vendor comparison possible at all — no
+  agent CLI serves a third party's models. These need `OPENROUTER_API_KEY` and
+  bill per token.
+- **CLI presets** (`claude-*`, `cross-backend-*`) run candidates through a local
+  agent CLI on a subscription. Nothing is billed per token, but the candidate
+  set is limited to what those CLIs serve.
+
+The two families are **not comparable to each other**: the prompts match, but
+under a CLI backend the harness delegates the tool loop to the CLI rather than
+driving it, so compare within a family. The numbers in
+`docs/BENCH_RESULTS.md` were produced by the API presets.
+
 Substitutions in the "paper" preset
 -----------------------------------
 The Google Co-Scientist paper compared their system against:
@@ -25,9 +40,12 @@ analogues and document the swap so reported numbers are interpretable:
     OpenAI o1                                 openai/o1               (exact)
     Claude Haiku (added by user request)      anthropic/claude-haiku-4.5
 
-Judge model is left configurable via --judge so users can pick a different
-referee. The recommended default for this preset is
-`openrouter:google/gemini-3-flash-preview`.
+What carries across both families is the science: the paper's AML
+drug-repurposing goal and its top-3 gold set.
+
+Judge model is configurable via --judge as "<provider>:<model>". Pick a judge in
+the same family as the candidates — `openrouter:google/gemini-3-flash-preview`
+for the API presets, `claude_cli:sonnet` for the CLI presets.
 """
 
 from __future__ import annotations
@@ -71,6 +89,15 @@ _PAPER_CANDIDATES: tuple[BenchCandidate, ...] = (
         provider="openrouter",
         model="anthropic/claude-haiku-4.5",
     ),
+)
+
+
+# Claude Code tiers. Spans the capability range so the bench still surfaces
+# a quality gradient, even though nothing is billed per token any more.
+_CLAUDE_CANDIDATES: tuple[BenchCandidate, ...] = (
+    BenchCandidate(label="opus", provider="claude_cli", model="opus"),
+    BenchCandidate(label="sonnet", provider="claude_cli", model="sonnet"),
+    BenchCandidate(label="haiku", provider="claude_cli", model="haiku"),
 )
 
 
@@ -129,9 +156,6 @@ def _vs_raw(candidates: tuple[BenchCandidate, ...]) -> tuple[BenchCandidate, ...
     return tuple(out)
 
 
-# Current frontier set — what you'd actually want to use today. Picked to
-# span pricing tiers so the bench surfaces $/quality tradeoffs, not just
-# raw quality.
 _FRONTIER_CANDIDATES: tuple[BenchCandidate, ...] = (
     BenchCandidate(
         label="claude-opus-4.7",
@@ -154,6 +178,16 @@ _FRONTIER_CANDIDATES: tuple[BenchCandidate, ...] = (
         provider="openrouter",
         model="google/gemini-3-flash-preview",
     ),
+)
+
+
+# Cross-backend set. Codex requires a ChatGPT account entitled to the model —
+# check with `codex exec -m <model>` before running this preset, since an
+# unentitled model fails the run rather than degrading.
+_CROSS_BACKEND_CANDIDATES: tuple[BenchCandidate, ...] = (
+    BenchCandidate(label="claude-opus", provider="claude_cli", model="opus"),
+    BenchCandidate(label="claude-sonnet", provider="claude_cli", model="sonnet"),
+    BenchCandidate(label="codex", provider="codex_cli", model="gpt-5.6-codex"),
 )
 
 
@@ -210,6 +244,48 @@ PRESETS: dict[str, BenchPreset] = {
         ),
         candidates=_vs_raw(_FRONTIER_CANDIDATES),
         suggested_judge="openrouter:google/gemini-3-flash-preview",
+        default_goal=_PAPER_AML_GOAL,
+        goldset=AML_REPURPOSING_PAPER_TOP3,
+    ),
+    "claude-aml": BenchPreset(
+        name="claude-aml",
+        description=(
+            "The paper's AML repurposing benchmark under its strict "
+            "methodology: candidates with NO prior repurposing evidence and "
+            "NO preclinical evidence in AML, no external inputs (DepMap, "
+            "expert feedback). Recall is scored against the top-3 candidates "
+            "the paper surfaced: Nanvuranlat, KIRA6, and Leflunomide. Runs "
+            "the three Claude Code tiers."
+        ),
+        candidates=_CLAUDE_CANDIDATES,
+        suggested_judge="claude_cli:sonnet",
+        default_goal=_PAPER_AML_GOAL,
+        goldset=AML_REPURPOSING_PAPER_TOP3,
+    ),
+    "claude-aml-vs-raw": BenchPreset(
+        name="claude-aml-vs-raw",
+        description=(
+            "AML repurposing benchmark where each Claude tier runs TWICE: "
+            "once through the full co-scientist Generation pipeline "
+            "(literature tools + dedup) and once as a single raw call. "
+            "Isolates how much performance comes from the multi-agent "
+            "harness versus the model itself. Same gold set as `claude-aml`."
+        ),
+        candidates=_vs_raw(_CLAUDE_CANDIDATES),
+        suggested_judge="claude_cli:sonnet",
+        default_goal=_PAPER_AML_GOAL,
+        goldset=AML_REPURPOSING_PAPER_TOP3,
+    ),
+    "cross-backend-aml": BenchPreset(
+        name="cross-backend-aml",
+        description=(
+            "Claude Code versus Codex on the AML repurposing benchmark. "
+            "Requires both CLIs installed and signed in, and a ChatGPT "
+            "account entitled to the Codex model — verify with "
+            "`co-scientist doctor` after setting [llm] provider = codex_cli."
+        ),
+        candidates=_CROSS_BACKEND_CANDIDATES,
+        suggested_judge="claude_cli:sonnet",
         default_goal=_PAPER_AML_GOAL,
         goldset=AML_REPURPOSING_PAPER_TOP3,
     ),

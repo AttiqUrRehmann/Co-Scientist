@@ -16,6 +16,7 @@ import faiss
 import numpy as np
 
 from ..config import Config
+from ..logging import get_logger
 
 
 class FaissStore:
@@ -38,16 +39,37 @@ class FaissStore:
     # ------------------------- lifecycle -------------------------------- #
 
     async def load_or_create(self) -> None:
+        """Load the session's index, or start a fresh one.
+
+        An index whose width no longer matches `embeddings.dim` is discarded and
+        rebuilt. Changing the embedding model or its `dimensions` invalidates
+        every vector already stored, and FAISS would otherwise fail deep inside
+        `add`/`search` with an assertion that says nothing about the cause.
+        Rebuilding costs re-embedding; keeping it would mean silent nonsense.
+        """
         self._dir.mkdir(parents=True, exist_ok=True)
 
-        def _do() -> tuple[faiss.IndexFlatIP, list[str]]:
+        def _do() -> tuple[faiss.IndexFlatIP, list[str], int | None]:
             if self._index_path.exists() and self._meta_path.exists():
                 idx = faiss.read_index(str(self._index_path))
                 meta = json.loads(self._meta_path.read_text())
-                return idx, list(meta.get("ordered_ids", []))
-            return faiss.IndexFlatIP(self.dim), []
+                # `idx.d` is authoritative; meta["dim"] is only a record of what
+                # wrote it, and predates this check on older indices.
+                stored_dim = getattr(idx, "d", None) or meta.get("dim")
+                if stored_dim == self.dim:
+                    return idx, list(meta.get("ordered_ids", [])), None
+                return faiss.IndexFlatIP(self.dim), [], stored_dim
+            return faiss.IndexFlatIP(self.dim), [], None
 
-        self.index, self._ordered_ids = await asyncio.to_thread(_do)
+        self.index, self._ordered_ids, discarded_dim = await asyncio.to_thread(_do)
+        if discarded_dim is not None:
+            get_logger("vectors.store").warning(
+                "faiss_index_dim_mismatch_rebuilding",
+                session_id=self.session_id,
+                found_dim=discarded_dim,
+                expected_dim=self.dim,
+                path=str(self._index_path),
+            )
         self._offset_by_id = {hid: i for i, hid in enumerate(self._ordered_ids)}
 
     async def save(self) -> None:

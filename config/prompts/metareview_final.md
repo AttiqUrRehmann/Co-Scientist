@@ -6,10 +6,13 @@ Scientist preferences:
 {{ preferences | default('') }}
 
 Latest system feedback:
-{{ system_feedback | default('(none)') }}
+{{ system_feedback | default('(none)', true) }}
 
 Top-ranked hypotheses (ordered by tournament Elo, with their reviews and winning debate rationales):
 {{ top_hypotheses_block }}
+
+Sources the investigation actually consulted. Every URL below appeared in a search or fetch result during generation or review — these are the only citations you may use:
+{{ sources | default('(no literature sources were recorded for this session)', true) }}
 
 Your job is to produce a coherent research overview that the scientist can act on. Structure your response as follows:
 
@@ -29,4 +32,6 @@ Briefly note which hypotheses converged on similar mechanisms and which directio
 # Caveats and limitations
 What did the system not explore? Where was the literature thin? Where would a domain expert most likely disagree with the tournament's verdict?
 
-Use markdown formatting. Cite hypothesis IDs as `[H-...]` inline. Cite literature URLs when they appear in supporting reviews. Do not invent citations.
+Use markdown formatting. Cite hypothesis IDs as `[H-...]` inline.
+
+Citations: cite sources by their `[S...]` tag inline, and close with a `# Sources` section listing each tag you used with its full URL. **Use only URLs from the source list above — never invent one, and never cite a URL that is not listed.** If the list is empty, say so plainly and mark literature claims as requiring the scientist's verification.

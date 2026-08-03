@@ -1,42 +1,57 @@
-"""LLMProvider — vendor-agnostic LLM client interface.
+"""LLMProvider — the interface every backend implements, and its factory.
 
-The co-scientist began as an Anthropic-only system; the type hints and
-intermediate request shapes (`AgentCallSpec`, `CachedBlock`) are
-Anthropic-flavored. Rather than rewrite every agent we treat those types as
-the canonical normalized form: each provider takes a normalized spec, calls
-its vendor SDK, and returns an `AnthropicResponse` whose `.raw` exposes a
-Message-like object with `.content`, `.stop_reason`, `.usage`.
+Three families of backend serve the same six agents. Each takes a normalized
+`AgentCallSpec` and returns an `LLMResponse` whose `.raw` is
+Anthropic-Message-shaped (`.content` blocks, `.stop_reason`, `.usage`) — see
+`llm/types.py` for why that shape is the contract.
 
-Concretely:
-- AnthropicProvider: passes through to anthropic.AsyncAnthropic.messages.create.
-- OpenAIProvider: translates to openai.chat.completions.create (also supports
-  arbitrary OpenAI-compatible base_urls: Groq, Together, OpenRouter, Mistral,
-  Ollama, Gemini OpenAI-compat endpoint).
+**Metered API, Anthropic** (`anthropic`) — passes through to
+`anthropic.AsyncAnthropic.messages.create`. The only backend with prompt-cache
+breakpoints and a Batch API.
+
+**Metered API, OpenAI-shaped** (`openai`, `openai_compatible`, and the named
+presets `openrouter` / `gemini` / `google` / `groq` / `together` / `mistral` /
+`ollama`) — translates to `openai.chat.completions.create` against the
+appropriate base_url.
+
+**Subscription CLI** (`claude_cli`, `codex_cli`) — drives a locally installed
+agent harness (`claude -p`, `codex exec`) over its own OAuth login. No API key
+is involved, and any that are present in the environment are stripped from the
+subprocess so a call can never silently fall back to metered billing. These
+run their own agentic loop, so they set `runs_own_loop` and `tool_loop.py`
+reads their captured tool use rather than driving turns.
 
 Provider-specific features:
-- cache_control: honored only on Anthropic. Stripped before sending elsewhere.
-- thinking / extended reasoning: Anthropic for Claude opus; on OpenAI we
-  translate to `reasoning_effort` for o-series models. The named Gemini
-  provider accepts optional semantic levels under `[llm.gemini]`.
+- cache_control: honored only on Anthropic. Stripped before sending elsewhere;
+  advisory under the CLI backends, whose harness manages its own cache.
+- thinking / extended reasoning: Anthropic uses numeric `[thinking]` budgets;
+  OpenAI reasoning models get `reasoning_effort`; the named Gemini provider
+  accepts optional semantic levels under `[llm.gemini]`; the CLI backends map
+  the budget onto `--effort` tiers.
 - provider-owned tool-call fields: retained as opaque metadata by the
   OpenAI-compatible adapter; only provider-documented request fields are
   replayed (currently Gemini's thought-signature envelope).
 - batch API: Anthropic only; the BatchPool still talks to Anthropic directly.
 
-Users select a provider in `[llm] provider = "..."` and per-agent models in
-`[models]`. Model strings are passed verbatim to the configured provider.
+Users select a backend in `[llm] provider = "..."` and per-agent models in
+`[models]`. Model strings are passed verbatim to the configured backend, so
+they are vendor model ids for the API providers and whatever the CLI's
+`--model` accepts for the CLI backends (Claude Code takes both aliases like
+`"opus"` and full ids like `"claude-sonnet-4-6"`).
 """
 
 from __future__ import annotations
 
+import shutil
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from .anthropic_client import AgentCallSpec, AnthropicResponse, CallContext
+from .types import AgentCallSpec, CallContext, LLMResponse
 
 
 @runtime_checkable
 class LLMProvider(Protocol):
-    """Common interface every LLM client implements."""
+    """Common interface every backend implements."""
 
     async def call(
         self,
@@ -44,12 +59,15 @@ class LLMProvider(Protocol):
         ctx: CallContext,
         *,
         est_input_tokens: int | None = None,
-    ) -> AnthropicResponse:
+    ) -> LLMResponse:
         ...
 
 
-# Provider names accepted in config.
-KNOWN_PROVIDERS = frozenset({
+# Backends that drive a local agent CLI on a subscription login.
+CLI_BACKENDS = frozenset({"claude_cli", "codex_cli"})
+
+# Backends that call a metered HTTP API with a key.
+API_PROVIDERS = frozenset({
     "anthropic",
     "openai",
     "openai_compatible",
@@ -61,6 +79,13 @@ KNOWN_PROVIDERS = frozenset({
     "mistral",        # convenience preset
     "ollama",         # convenience preset
 })
+
+# Everything accepted in `[llm] provider`.
+KNOWN_PROVIDERS = API_PROVIDERS | CLI_BACKENDS
+
+
+class BackendUnavailable(RuntimeError):
+    """The configured backend cannot be used (missing CLI, missing key)."""
 
 
 # Built-in presets for OpenAI-compatible endpoints. `api_key_env` is the
@@ -78,7 +103,7 @@ OPENAI_COMPAT_PRESETS: dict[str, dict[str, str | dict[str, str] | None]] = {
     "gemini": {
         # Google's Gemini OpenAI-compat endpoint. Speaks chat.completions,
         # accepts tools/function calling, and tracks the same usage shape.
-        # Model ids look like "gemini-2.5-pro", "gemini-2.5-flash".
+        # Model ids look like "gemini-3-flash", "gemini-2.5-pro".
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "api_key_env": "GEMINI_API_KEY",
         "default_headers_factory": None,
@@ -133,7 +158,7 @@ def get_provider(
     budget,
     retry_policy=None,
 ) -> LLMProvider:
-    """Construct the LLM provider configured in `cfg.llm.provider`.
+    """Construct the backend configured in `cfg.llm.provider`.
 
     Selection is case-insensitive. Unknown values fall back to `anthropic`
     with a warning so older configs continue to work.
@@ -146,6 +171,18 @@ def get_provider(
     if name not in KNOWN_PROVIDERS:
         log.warning("unknown_llm_provider", configured=name, fallback="anthropic")
         name = "anthropic"
+
+    # Subscription CLI backends. Imported lazily so an API-only install never
+    # pays for the subprocess machinery, and vice versa.
+    if name == "claude_cli":
+        from .cli_backend.claude_code import ClaudeCliProvider
+
+        return ClaudeCliProvider(cfg, db=db, budget=budget, retry_policy=retry_policy)
+
+    if name == "codex_cli":
+        from .cli_backend.codex import CodexCliProvider
+
+        return CodexCliProvider(cfg, db=db, budget=budget, retry_policy=retry_policy)
 
     if name == "anthropic":
         from .anthropic_client import AnthropicClient
@@ -184,3 +221,137 @@ def get_provider(
 
     # Unreachable
     raise ValueError(f"unsupported LLM provider {name!r}")
+
+
+# --------------------------------------------------------------------------- #
+# preflight
+
+
+@dataclass
+class BackendStatus:
+    """What `co-scientist doctor` and `init` report."""
+
+    backend: str
+    binary: str
+    binary_path: str | None
+    version: str | None
+    authenticated: bool
+    detail: str
+
+    @property
+    def ok(self) -> bool:
+        return self.authenticated and (self.binary_path is not None or not self.binary)
+
+
+def check_backend(cfg) -> BackendStatus:
+    """Verify the configured backend is usable before a run starts.
+
+    Deliberately cheap: for a CLI backend it probes `--version` and the login
+    state, never a model call, so `doctor` costs nothing against the
+    subscription. For an API provider it checks that a key is resolvable — the
+    only preflight possible without spending money.
+    """
+    name = (getattr(cfg.llm, "provider", "anthropic") or "anthropic").strip().lower()
+    if name not in KNOWN_PROVIDERS:
+        name = "anthropic"
+    if name in API_PROVIDERS:
+        return _check_api_provider(cfg, name)
+    return _check_cli_backend(cfg, name)
+
+
+def _check_api_provider(cfg, name: str) -> BackendStatus:
+    """An API provider is ready when a key for its endpoint resolves.
+
+    Key precedence (including the OPENAI_API_KEY-wins rule for the
+    OpenAI-compatible presets) lives in `config.has_llm_key`; this only reports
+    it, so the two cannot drift.
+    """
+    from ..config import has_llm_key, provider_key_env
+
+    env_var = provider_key_env(cfg)
+    authenticated = has_llm_key(cfg)
+    if not env_var:
+        detail = "local endpoint, no key required"
+    elif authenticated:
+        detail = f"key resolved for {env_var}"
+    else:
+        detail = f"no API key — set {env_var} (or OPENAI_API_KEY for a preset)."
+
+    return BackendStatus(
+        backend=name, binary="", binary_path=None, version=None,
+        authenticated=authenticated, detail=detail,
+    )
+
+
+def _check_cli_backend(cfg, name: str) -> BackendStatus:
+    """A CLI backend is ready when its binary is on PATH and signed in."""
+    import subprocess
+
+    if name == "codex_cli":
+        binary = cfg.llm.codex_cli.binary
+        auth_cmd = [binary, "login", "status"]
+        auth_marker = "logged in"
+    else:
+        name = "claude_cli"
+        binary = cfg.llm.claude_cli.binary
+        auth_cmd = None
+        auth_marker = ""
+
+    path = shutil.which(binary)
+    if path is None:
+        return BackendStatus(
+            backend=name, binary=binary, binary_path=None, version=None,
+            authenticated=False,
+            detail=f"{binary!r} not found on PATH — install it and sign in.",
+        )
+
+    version = _probe(subprocess, [path, "--version"])
+
+    if auth_cmd is not None:
+        status_text = _probe(subprocess, [path, *auth_cmd[1:]]) or ""
+        authenticated = auth_marker in status_text.lower()
+        detail = status_text or "no auth status reported"
+    else:
+        authenticated = _claude_signed_in()
+        detail = (
+            "signed in with a Claude subscription"
+            if authenticated
+            else "not signed in — run `claude` once and complete the login."
+        )
+
+    return BackendStatus(
+        backend=name, binary=binary, binary_path=path, version=version,
+        authenticated=authenticated, detail=detail,
+    )
+
+
+def _claude_signed_in() -> bool:
+    """Detect a Claude Code subscription session without spending quota.
+
+    Claude Code has no `login status` subcommand, and where it keeps the OAuth
+    token is platform-dependent: the macOS keychain, or a credentials file
+    elsewhere. `~/.claude.json` carries an `oauthAccount` record on every
+    platform once login completes, so that is the portable signal; the file
+    check covers installs that store credentials on disk.
+    """
+    import json
+    from pathlib import Path
+
+    config = Path.home() / ".claude.json"
+    if config.exists():
+        try:
+            if json.loads(config.read_text(encoding="utf-8")).get("oauthAccount"):
+                return True
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
+    return (Path.home() / ".claude" / ".credentials.json").exists()
+
+
+def _probe(subprocess_mod, argv: list[str]) -> str | None:
+    try:
+        out = subprocess_mod.run(
+            argv, capture_output=True, text=True, timeout=20, check=False,
+        )
+    except (OSError, ValueError, subprocess_mod.SubprocessError):
+        return None
+    return (out.stdout or out.stderr or "").strip() or None
